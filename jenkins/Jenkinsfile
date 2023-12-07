@@ -1,0 +1,27 @@
+pipeline {
+    agent { label 'gpu' }
+    stages {
+        stage('Setup') {
+            steps {
+                  sh "bash jenkins/build.sh"
+            }
+        }
+        stage('cleanup') {
+            steps {
+                sh "psql --host=127.0.0.1  --username=postgres --dbname=testdb --file=jenkins/cleanup-testdata.sql"
+            } 
+        }     
+        stage('arrow_fdw test') {
+            steps {
+                sh "ls"
+                sh "psql --host=127.0.0.1  --username=postgres --dbname=testdb --file=jenkins/import-arrowdata.sql"
+            } 
+        }
+        stage('CI test') {
+            steps {
+                sh "psql --host=127.0.0.1  --username=postgres --dbname=testdb --file=jenkins/citest.sql"
+            } 
+        }       
+        /* comment out */   
+    }
+}

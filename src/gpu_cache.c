@@ -1623,9 +1623,9 @@ __initialLoadGpuCacheVisibilityCheck(HeapTuple tuple,
 									 TransactionId *gcache_xmin,
 									 TransactionId *gcache_xmax)
 {
-	HeapTupleHeader		htup = tuple->t_data;
-	TransactionId		xmin;
-	TransactionId		xmax;
+	HeapTupleHeader	htup = tuple->t_data;
+	TransactionId	xmin;
+	TransactionId	xmax;
 
 	if (!HeapTupleHeaderXminCommitted(htup))
 	{
@@ -1634,6 +1634,17 @@ __initialLoadGpuCacheVisibilityCheck(HeapTuple tuple,
 		xmin = HeapTupleHeaderGetRawXmin(htup);
 		if (TransactionIdIsCurrentTransactionId(xmin))
 		{
+			if (HeapTupleHeaderGetCmin(htup) >= GetCurrentCommandId(false))
+			{
+				/*
+				 * This tuple is written in this command (INSERT/UPDATE),
+				 * and it should be tracked by the AFTER ROW trigger.
+				 * Thus, rowid allocation and insertion shall be done
+				 * in the trigger function to be called later.
+				 */
+				return false;
+			}
+
 			*gcache_xmin = xmin;
 			if (htup->t_infomask & HEAP_XMAX_INVALID)
 			{
@@ -1724,6 +1735,17 @@ __initialLoadGpuCacheVisibilityCheck(HeapTuple tuple,
 	{
 		if (HEAP_XMAX_IS_LOCKED_ONLY(htup->t_infomask))
 			*gcache_xmax = InvalidTransactionId;
+		else if (HeapTupleHeaderGetCmax(htup) >= GetCurrentCommandId(false))
+		{
+			/*
+			 * This tuple is removed by the current command (UPDATE/DELETE),
+			 * and its relevant AFTER-ROW trigger function should release its
+			 * rowid after the initial loading.
+			 * So, at this point, we perform like as this tuple is not removed
+			 * yet.
+			 */
+			*gcache_xmax = InvalidTransactionId;
+		}
 		else
 			*gcache_xmax = xmax;
 		return true;
@@ -2442,6 +2464,7 @@ pgstrom_gpucache_sync_trigger(PG_FUNCTION_ARGS)
 		{
 			tuple = __makeFlattenHeapTuple(trigdata->tg_relation,
 										   trigdata->tg_newtuple);
+
 			__gpuCacheDeleteLog(trigdata->tg_trigtuple, gc_desc);
 			__gpuCacheInsertLog(tuple, gc_desc);
 			if (tuple != trigdata->tg_newtuple)
@@ -3220,7 +3243,6 @@ __gpucacheExecCompactionKernel(GpuCacheControlCommand *cmd,
 	kern_data_extra *kds_extra;
 	CUdeviceptr	m_kds_extra = 0UL;
 	int			grid_sz, block_sz;
-	unsigned int shmem_sz;
 	void	   *kern_args[4];
 	CUresult	rc;
 
@@ -3242,9 +3264,7 @@ retry:
 
 	rc = gpuOptimalBlockSize(&grid_sz,
 							 &block_sz,
-							 &shmem_sz,
-							 f_gcache_compaction,
-							 0, 0);
+							 f_gcache_compaction, 0);
 	if (rc != CUDA_SUCCESS)
 	{
 		snprintf(cmd->errbuf, sizeof(cmd->errbuf),
@@ -3257,7 +3277,7 @@ retry:
 	rc = cuLaunchKernel(f_gcache_compaction,
 						grid_sz, 1, 1,
 						block_sz, 1, 1,
-						shmem_sz,
+						0,
 						CU_STREAM_LEGACY,
 						kern_args,
 						NULL);
@@ -3351,7 +3371,6 @@ __gpucacheExecApplyRedoKernel(GpuCacheControlCommand *cmd,
 	size_t		offset;
 	char	   *pos, *end;
 	int			grid_sz, block_sz;
-	unsigned int shmem_sz;
 	void	   *kern_args[4];
 	kern_gpucache_redolog *gcache_redo;
 	CUdeviceptr	m_gcache_redo = 0UL;
@@ -3425,9 +3444,7 @@ __gpucacheExecApplyRedoKernel(GpuCacheControlCommand *cmd,
 	/* GPU kernel invocation */
 	rc = gpuOptimalBlockSize(&grid_sz,
 							 &block_sz,
-							 &shmem_sz,
-							 f_gcache_apply_redo,
-							 0, 0);
+							 f_gcache_apply_redo, 0);
 	if (rc != CUDA_SUCCESS)
 	{
 		snprintf(cmd->errbuf, sizeof(cmd->errbuf),
@@ -3445,7 +3462,7 @@ retry:
 		rc = cuLaunchKernel(f_gcache_apply_redo,
 							grid_sz, 1, 1,
 							block_sz, 1, 1,
-							shmem_sz,
+							0,
 							CU_STREAM_LEGACY,
 							kern_args,
 							NULL);
@@ -4211,7 +4228,10 @@ pgstrom_gpucache_info(PG_FUNCTION_ARGS)
 	memset(isnull, 0, sizeof(isnull));
 	values[0] = ObjectIdGetDatum(gc_sstate->ident.database_oid);
 	str = get_database_name(gc_sstate->ident.database_oid);
-	values[1] = CStringGetTextDatum(str);
+	if (str)
+		values[1] = CStringGetTextDatum(str);
+	else
+		isnull[1] = true;
 	values[2] = ObjectIdGetDatum(gc_sstate->ident.table_oid);
 	values[3] = CStringGetTextDatum(gc_sstate->table_name);
 	values[4] = Int64GetDatum(gc_sstate->ident.signature);

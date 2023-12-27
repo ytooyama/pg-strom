@@ -80,7 +80,10 @@ __collectGpuDevAttrs(GpuDevAttributes *dattrs, CUdevice cuda_device)
 	rc = cuDeviceGetAttribute(&dattrs->LABEL,						\
 							  CU_DEVICE_ATTRIBUTE_##LABEL,			\
 							  cuda_device);							\
-	if (rc != CUDA_SUCCESS)											\
+	if (CU_DEVICE_ATTRIBUTE_##LABEL > CU_DEVICE_ATTRIBUTE_GPU_DIRECT_RDMA_SUPPORTED &&	\
+		rc == CUDA_ERROR_INVALID_VALUE)								\
+		dattrs->LABEL = DEV_ATTR__UNKNOWN;							\
+	else if (rc != CUDA_SUCCESS)									\
 		__FATAL("failed on cuDeviceGetAttribute(" #LABEL "): %s",	\
 				cuStrError(rc));
 #include "gpu_devattrs.h"
@@ -519,53 +522,18 @@ gpuClientOpenSession(pgstromTaskState *pts,
  * optimal_workgroup_size - calculates the optimal block size
  * according to the function and device attributes
  */
-static __thread size_t __dynamic_shmem_per_block;
-static __thread size_t __dynamic_shmem_per_warp;
-
-static size_t
-blocksize_to_shmemsize_helper(int blocksize)
-{
-	int		n_warps = (blocksize + WARPSIZE - 1) / WARPSIZE;
-
-	return MAXALIGN(__dynamic_shmem_per_block +
-					__dynamic_shmem_per_warp * n_warps);
-}
-
 CUresult
 gpuOptimalBlockSize(int *p_grid_sz,
 					int *p_block_sz,
-					unsigned int *p_shmem_sz,
 					CUfunction kern_function,
-					size_t dynamic_shmem_per_block,
-					size_t dynamic_shmem_per_warp)
+					unsigned int dynamic_shmem_per_block)
 {
-	CUresult	rc;
-
-	if (dynamic_shmem_per_warp == 0)
-	{
-		rc = cuOccupancyMaxPotentialBlockSize(p_grid_sz,
-											  p_block_sz,
-											  kern_function,
-											  NULL,
-											  dynamic_shmem_per_block,
-											  0);
-		if (rc == CUDA_SUCCESS)
-			*p_shmem_sz = dynamic_shmem_per_block;
-	}
-	else
-	{
-		__dynamic_shmem_per_block  = dynamic_shmem_per_block;
-		__dynamic_shmem_per_warp   = dynamic_shmem_per_warp;
-		rc = cuOccupancyMaxPotentialBlockSize(p_grid_sz,
-											  p_block_sz,
-											  kern_function,
-											  blocksize_to_shmemsize_helper,
-											  dynamic_shmem_per_block,
-											  0);
-		if (rc == CUDA_SUCCESS)
-			*p_shmem_sz = blocksize_to_shmemsize_helper(*p_block_sz);
-	}
-	return rc;
+	return cuOccupancyMaxPotentialBlockSize(p_grid_sz,
+											p_block_sz,
+											kern_function,
+											NULL,
+											dynamic_shmem_per_block,
+											0);
 }
 
 /*
@@ -719,7 +687,10 @@ pgstrom_gpu_device_info(PG_FUNCTION_ARGS)
 					break;
 
 				default:
-					att_value = psprintf("%d", val);
+					if (val != DEV_ATTR__UNKNOWN)
+						att_value = psprintf("%d", val);
+					else
+						att_value = NULL;
 					break;
 			}
 			break;
@@ -727,7 +698,10 @@ pgstrom_gpu_device_info(PG_FUNCTION_ARGS)
 	memset(isnull, 0, sizeof(isnull));
 	values[0] = Int32GetDatum(dattrs->DEV_ID);
 	values[1] = CStringGetTextDatum(att_name);
-	values[2] = CStringGetTextDatum(att_value);
+	if (att_value)
+		values[2] = CStringGetTextDatum(att_value);
+	else
+		isnull[2] = true;
 	if (att_desc)
 		values[3] = CStringGetTextDatum(att_desc);
 	else

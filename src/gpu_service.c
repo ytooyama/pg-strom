@@ -93,7 +93,6 @@ typedef struct
 /*
  * variables
  */
-int		pgstrom_max_async_gpu_tasks;	/* GUC */
 static __thread int			MY_DINDEX_PER_THREAD = -1;
 static __thread CUdevice	MY_DEVICE_PER_THREAD = -1;
 static __thread CUcontext	MY_CONTEXT_PER_THREAD = NULL;
@@ -653,7 +652,6 @@ __setupGpuQueryJoinGiSTIndexBuffer(gpuContext *gcontext,
 	CUresult	rc;
 	int			grid_sz;
 	int			block_sz;
-	unsigned int shmem_sz;
 	void	   *kern_args[10];
 	bool		has_gist = false;
 
@@ -674,9 +672,7 @@ __setupGpuQueryJoinGiSTIndexBuffer(gpuContext *gcontext,
 			}
 			rc = gpuOptimalBlockSize(&grid_sz,
 									 &block_sz,
-									 &shmem_sz,
-									 f_prep_gist,
-									 0, 0);
+									 f_prep_gist, 0);
 			if (rc != CUDA_SUCCESS)
 			{
 				snprintf(errmsg, errmsg_sz,
@@ -689,7 +685,7 @@ __setupGpuQueryJoinGiSTIndexBuffer(gpuContext *gcontext,
 		rc = cuLaunchKernel(f_prep_gist,
 							grid_sz, 1, 1,
 							block_sz, 1, 1,
-							shmem_sz,
+							0,
 							MY_STREAM_PER_THREAD,
 							kern_args,
 							NULL);
@@ -1659,16 +1655,14 @@ gpuservLoadKdsArrow(gpuClient *gclient,
 static unsigned int
 __expand_gpupreagg_prepfunc_buffer(kern_session_info *session,
 								   int grid_sz, int block_sz,
-								   unsigned int shmem_base_sz,
-								   unsigned int shmem_dynamic_sz,
+								   unsigned int __shmem_dynamic_sz,
+								   unsigned int shmem_dynamic_limit,
 								   unsigned int *p_groupby_prepfn_bufsz,
 								   unsigned int *p_groupby_prepfn_nbufs)
 {
-	unsigned int	prepfn_usage;
-	unsigned int	num_buffers;
+	unsigned int	shmem_dynamic_sz = TYPEALIGN(1024, __shmem_dynamic_sz);
 
-	shmem_base_sz = TYPEALIGN(1024, shmem_base_sz);
-	if (session->groupby_prepfn_bufsz == 0 || shmem_base_sz >= shmem_dynamic_sz)
+	if (session->groupby_prepfn_bufsz == 0 || shmem_dynamic_sz >= shmem_dynamic_limit)
 		goto no_prepfunc_buffer;
 
 	if (session->xpucode_groupby_keyhash &&
@@ -1676,35 +1670,38 @@ __expand_gpupreagg_prepfunc_buffer(kern_session_info *session,
 		session->xpucode_groupby_keycomp)
 	{
 		/* GROUP-BY */
-		num_buffers = 2 * session->groupby_ngroups_estimation + 100;
-		prepfn_usage = session->groupby_prepfn_bufsz * num_buffers;
-		if (shmem_base_sz + prepfn_usage > shmem_dynamic_sz)
+		int		num_buffers = 2 * session->groupby_ngroups_estimation + 100;
+		int		prepfn_usage = session->groupby_prepfn_bufsz * num_buffers;
+
+		if (shmem_dynamic_sz + prepfn_usage > shmem_dynamic_limit)
 		{
 			/* adjust num_buffers, if too large */
-			num_buffers = (shmem_dynamic_sz -
-						   shmem_base_sz) / session->groupby_prepfn_bufsz;;
+			num_buffers = (shmem_dynamic_limit -
+						   shmem_dynamic_sz) / session->groupby_prepfn_bufsz;
 			prepfn_usage = session->groupby_prepfn_bufsz * num_buffers;
 		}
-		Assert(shmem_base_sz + prepfn_usage <= shmem_dynamic_sz);
-		if (num_buffers < 32)
-			goto no_prepfunc_buffer;
+		Assert(shmem_dynamic_sz + prepfn_usage <= shmem_dynamic_limit);
+		if (num_buffers >= 32)
+		{
+			*p_groupby_prepfn_bufsz = session->groupby_prepfn_bufsz;
+			*p_groupby_prepfn_nbufs = num_buffers;
+			return shmem_dynamic_sz + prepfn_usage;
+		}
 	}
-	else
+	else if (session->xpucode_groupby_actions)
 	{
 		/* NO-GROUPS */
-		num_buffers = 1;
-		prepfn_usage = session->groupby_prepfn_bufsz;
-		if (shmem_base_sz + prepfn_usage > shmem_dynamic_sz)
-			goto no_prepfunc_buffer;
+		if (shmem_dynamic_sz + session->groupby_prepfn_bufsz <= shmem_dynamic_limit)
+		{
+			*p_groupby_prepfn_bufsz = session->groupby_prepfn_bufsz;
+			*p_groupby_prepfn_nbufs = 1;
+			return shmem_dynamic_sz + session->groupby_prepfn_bufsz;
+		}
 	}
-	*p_groupby_prepfn_bufsz = session->groupby_prepfn_bufsz;
-	*p_groupby_prepfn_nbufs = num_buffers;
-	return shmem_base_sz + prepfn_usage;
-
 no_prepfunc_buffer:
 	*p_groupby_prepfn_bufsz = 0;
 	*p_groupby_prepfn_nbufs = 0;
-	return shmem_base_sz;
+	return __shmem_dynamic_sz;		/* unaligned original size */
 }
 
 static void
@@ -1736,7 +1733,7 @@ gpuservHandleGpuTaskExec(gpuClient *gclient, XpuCommand *xcmd)
 	CUresult		rc;
 	int				grid_sz;
 	int				block_sz;
-	unsigned int	shmem_sz;
+	unsigned int	shmem_dynamic_sz;
 	unsigned int	groupby_prepfn_bufsz = 0;
 	unsigned int	groupby_prepfn_nbufs = 0;
 	size_t			kds_final_length = 0;
@@ -1842,13 +1839,11 @@ gpuservHandleGpuTaskExec(gpuClient *gclient, XpuCommand *xcmd)
 					   cuStrError(rc));
 		goto bailout;
 	}
-
+	shmem_dynamic_sz = __KERN_WARP_CONTEXT_BASESZ(session->kcxt_kvecs_ndims);
 	rc = gpuOptimalBlockSize(&grid_sz,
 							 &block_sz,
-							 &shmem_sz,
 							 f_kern_gpuscan,
-							 0,
-							 __KERN_WARP_CONTEXT_BASESZ(session->kcxt_kvecs_ndims));
+							 shmem_dynamic_sz);
 	if (rc != CUDA_SUCCESS)
 	{
 		gpuClientFatal(gclient, "failed on gpuOptimalBlockSize: %s",
@@ -1859,12 +1854,13 @@ gpuservHandleGpuTaskExec(gpuClient *gclient, XpuCommand *xcmd)
 //	grid_sz = 1;
 
 	/* allocation of extra shared memory for GpuPreAgg (if any) */
-	shmem_sz = __expand_gpupreagg_prepfunc_buffer(session,
-												  grid_sz, block_sz,
-												  shmem_sz,
-												  gcontext->gpumain_shmem_sz_dynamic,
-												  &groupby_prepfn_bufsz,
-												  &groupby_prepfn_nbufs);
+	shmem_dynamic_sz =
+		__expand_gpupreagg_prepfunc_buffer(session,
+										   grid_sz, block_sz,
+										   shmem_dynamic_sz,
+										   gcontext->gpumain_shmem_sz_dynamic,
+										   &groupby_prepfn_bufsz,
+										   &groupby_prepfn_nbufs);
 	/*
 	 * Allocation of the control structure
 	 */
@@ -1977,7 +1973,7 @@ resume_kernel:
 	rc = cuLaunchKernel(f_kern_gpuscan,
 						grid_sz, 1, 1,
 						block_sz, 1, 1,
-						shmem_sz,
+						shmem_dynamic_sz,
 						MY_STREAM_PER_THREAD,
 						kern_args,
 						NULL);
@@ -2439,6 +2435,7 @@ static HTAB *
 __setupDevTypeLinkageTable(CUmodule cuda_module)
 {
 	xpu_type_catalog_entry *xpu_types_catalog;
+	const char *symbol = "builtin_xpu_types_catalog";
 	HASHCTL		hctl;
 	HTAB	   *htab = NULL;
 	CUdeviceptr	dptr;
@@ -2456,10 +2453,10 @@ __setupDevTypeLinkageTable(CUmodule cuda_module)
 					   &hctl,
 					   HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
 
-	rc = cuModuleGetGlobal(&dptr, &nbytes, cuda_module,
-						   "builtin_xpu_types_catalog");
+	rc = cuModuleGetGlobal(&dptr, &nbytes, cuda_module, symbol);
 	if (rc != CUDA_SUCCESS)
-		elog(ERROR, "failed on cuModuleGetGlobal: %s", cuStrError(rc));
+		elog(ERROR, "failed on cuModuleGetGlobal('%s'): %s",
+			 symbol, cuStrError(rc));
 
 	xpu_types_catalog = alloca(nbytes);
 	rc = cuMemcpyDtoH(xpu_types_catalog, dptr, nbytes);
@@ -2487,6 +2484,7 @@ static HTAB *
 __setupDevFuncLinkageTable(CUmodule cuda_module)
 {
 	xpu_function_catalog_entry *xpu_funcs_catalog;
+	const char *symbol = "builtin_xpu_functions_catalog";
 	HASHCTL		hctl;
 	HTAB	   *htab;
 	CUdeviceptr	dptr;
@@ -2503,10 +2501,10 @@ __setupDevFuncLinkageTable(CUmodule cuda_module)
 					   &hctl,
 					   HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
 
-	rc = cuModuleGetGlobal(&dptr, &nbytes, cuda_module,
-						   "builtin_xpu_functions_catalog");
+	rc = cuModuleGetGlobal(&dptr, &nbytes, cuda_module, symbol);
 	if (rc != CUDA_SUCCESS)
-		elog(ERROR, "failed on cuModuleGetGlobal: %s", cuStrError(rc));
+		elog(ERROR, "failed on cuModuleGetGlobal('%s'): %s",
+			 symbol, cuStrError(rc));
 	xpu_funcs_catalog = alloca(nbytes);
 	rc = cuMemcpyDtoH(xpu_funcs_catalog, dptr, nbytes);
 	if (rc != CUDA_SUCCESS)
@@ -2533,14 +2531,15 @@ static xpu_encode_info *
 __setupDevEncodeLinkageCatalog(CUmodule cuda_module)
 {
 	xpu_encode_info *xpu_encode_catalog;
+	const char *symbol = "xpu_encode_catalog";
 	CUdeviceptr	dptr;
 	CUresult	rc;
 	size_t		nbytes;
 
-	rc = cuModuleGetGlobal(&dptr, &nbytes, cuda_module,
-                           "xpu_encode_catalog");
+	rc = cuModuleGetGlobal(&dptr, &nbytes, cuda_module, symbol);
 	if (rc != CUDA_SUCCESS)
-		elog(ERROR, "failed on cuModuleGetGlobal: %s", cuStrError(rc));
+		elog(ERROR, "failed on cuModuleGetGlobal('%s'): %s",
+			 symbol, cuStrError(rc));
 	xpu_encode_catalog = MemoryContextAlloc(TopMemoryContext, nbytes);
 	rc = cuMemcpyDtoH(xpu_encode_catalog, dptr, nbytes);
 	if (rc != CUDA_SUCCESS)
@@ -3163,16 +3162,6 @@ pgstrom_init_gpu_service(void)
 	BackgroundWorker worker;
 
 	Assert(numGpuDevAttrs > 0);
-	DefineCustomIntVariable("pg_strom.max_async_gpu_tasks",
-							"Max number of asynchronous GPU tasks",
-							NULL,
-							&pgstrom_max_async_gpu_tasks,
-							8,
-							1,
-							INT_MAX,
-							PGC_POSTMASTER,
-							GUC_NOT_IN_SAMPLE,
-							NULL, NULL, NULL);
 	DefineCustomIntVariable("pg_strom.gpu_mempool_segment_sz",
 							"Segment size of GPU memory pool",
 							NULL,

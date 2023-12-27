@@ -529,7 +529,7 @@ xpu_timestamp_datum_arrow_read(kern_context *kcxt,
 							   xpu_datum_t *__result)
 {
 	xpu_timestamp_t *result = (xpu_timestamp_t *)__result;
-	const uint64_t	*addr;
+	const int64_t	*addr;
 
 	if (cmeta->attopts.tag != ArrowType__Timestamp)
 	{
@@ -540,8 +540,8 @@ xpu_timestamp_datum_arrow_read(kern_context *kcxt,
 	switch (cmeta->attopts.timestamp.unit)
 	{
 		case ArrowTimeUnit__Second:
-			addr = (const uint64_t *)
-				KDS_ARROW_REF_SIMPLE_DATUM(kds, cmeta, kds_index, sizeof(uint64_t));
+			addr = (const int64_t *)
+				KDS_ARROW_REF_SIMPLE_DATUM(kds, cmeta, kds_index, sizeof(int64_t));
 			if (!addr)
 				result->expr_ops = NULL;
 			else
@@ -553,8 +553,8 @@ xpu_timestamp_datum_arrow_read(kern_context *kcxt,
 			break;
 
 		case ArrowTimeUnit__MilliSecond:
-			addr = (const uint64_t *)
-				KDS_ARROW_REF_SIMPLE_DATUM(kds, cmeta, kds_index, sizeof(uint64_t));
+			addr = (const int64_t *)
+				KDS_ARROW_REF_SIMPLE_DATUM(kds, cmeta, kds_index, sizeof(int64_t));
 			if (!addr)
 				result->expr_ops = NULL;
 			else
@@ -566,8 +566,8 @@ xpu_timestamp_datum_arrow_read(kern_context *kcxt,
 			break;
 
 		case ArrowTimeUnit__MicroSecond:
-			addr = (const uint64_t *)
-				KDS_ARROW_REF_SIMPLE_DATUM(kds, cmeta, kds_index, sizeof(uint64_t));
+			addr = (const int64_t *)
+				KDS_ARROW_REF_SIMPLE_DATUM(kds, cmeta, kds_index, sizeof(int64_t));
 			if (!addr)
 				result->expr_ops = NULL;
 			else
@@ -579,8 +579,8 @@ xpu_timestamp_datum_arrow_read(kern_context *kcxt,
 			break;
 
 		case ArrowTimeUnit__NanoSecond:
-			addr = (const uint64_t *)
-				KDS_ARROW_REF_SIMPLE_DATUM(kds, cmeta, kds_index, sizeof(uint64_t));
+			addr = (const int64_t *)
+				KDS_ARROW_REF_SIMPLE_DATUM(kds, cmeta, kds_index, sizeof(int64_t));
 			if (!addr)
 				result->expr_ops = NULL;
 			else
@@ -708,8 +708,74 @@ xpu_timestamptz_datum_arrow_read(kern_context *kcxt,
 								 uint32_t kds_index,
 								 xpu_datum_t *__result)
 {
-	STROM_ELOG(kcxt, "xpu_timestamptz_t cannot be mapped on any Arrow type");
-	return false;
+	xpu_timestamptz_t *result = (xpu_timestamptz_t *)__result;
+	const int64_t  *addr;
+
+	if (cmeta->attopts.tag != ArrowType__Timestamp)
+	{
+		STROM_ELOG(kcxt, "xpu_timestamptz_t must be mapped on Arrow::Timestamp");
+		return false;
+	}
+
+	switch (cmeta->attopts.timestamp.unit)
+    {
+		case ArrowTimeUnit__Second:
+			addr = (const int64_t *)
+				KDS_ARROW_REF_SIMPLE_DATUM(kds, cmeta, kds_index, sizeof(int64_t));
+			if (!addr)
+				result->expr_ops = NULL;
+			else
+			{
+				result->expr_ops = &xpu_timestamptz_ops;
+				result->value = *addr * 1000000L -
+					(POSTGRES_EPOCH_JDATE - UNIX_EPOCH_JDATE) * USECS_PER_DAY;
+			}
+			break;
+
+		case ArrowTimeUnit__MilliSecond:
+			addr = (const int64_t *)
+				KDS_ARROW_REF_SIMPLE_DATUM(kds, cmeta, kds_index, sizeof(int64_t));
+			if (!addr)
+				result->expr_ops = NULL;
+			else
+			{
+				result->expr_ops = &xpu_timestamptz_ops;
+				result->value = *addr * 1000L -
+					(POSTGRES_EPOCH_JDATE - UNIX_EPOCH_JDATE) * USECS_PER_DAY;
+			}
+			break;
+
+		case ArrowTimeUnit__MicroSecond:
+			addr = (const int64_t *)
+				KDS_ARROW_REF_SIMPLE_DATUM(kds, cmeta, kds_index, sizeof(int64_t));
+			if (!addr)
+				result->expr_ops = NULL;
+			else
+			{
+				result->expr_ops = &xpu_timestamptz_ops;
+				result->value = *addr -
+					(POSTGRES_EPOCH_JDATE - UNIX_EPOCH_JDATE) * USECS_PER_DAY;
+            }
+            break;
+
+		case ArrowTimeUnit__NanoSecond:
+			addr = (const int64_t *)
+				KDS_ARROW_REF_SIMPLE_DATUM(kds, cmeta, kds_index, sizeof(int64_t));
+			if (!addr)
+				result->expr_ops = NULL;
+			else
+			{
+				result->expr_ops = &xpu_timestamptz_ops;
+				result->value = *addr / 1000 -
+					(POSTGRES_EPOCH_JDATE - UNIX_EPOCH_JDATE) * USECS_PER_DAY;
+			}
+			break;
+
+		default:
+			STROM_ELOG(kcxt, "unknown unit size of Arrow::Timestamp");
+			return false;
+	}
+	return true;
 }
 
 STATIC_FUNCTION(bool)
@@ -991,7 +1057,12 @@ xpu_interval_datum_comp(kern_context *kcxt,
 	assert(!XPU_DATUM_ISNULL(a) && !XPU_DATUM_ISNULL(b));
 	aval = interval_cmp_value(&a->value);
 	bval = interval_cmp_value(&b->value);
-	*p_comp = (aval - bval);
+	if (aval < bval)
+		*p_comp = -1;
+	else if (aval > bval)
+		*p_comp = 1;
+	else
+		*p_comp = 0;
 	return true;
 }
 PGSTROM_SQLTYPE_OPERATORS(interval, false, 8, sizeof(Interval));
@@ -2134,9 +2205,9 @@ __compare_date_timestamptz(kern_context *kcxt, DateADT a, TimestampTz b)
 	return 0;
 }
 INLINE_FUNCTION(int)
-__compare_timestamptz_date(kern_context *kcxt, DateADT a, TimestampTz b)
+__compare_timestamptz_date(kern_context *kcxt, TimestampTz a, DateADT b)
 {
-	return __compare_date_timestamptz(kcxt, b, a);
+	return -__compare_date_timestamptz(kcxt, b, a);
 }
 PG_FLEXIBLE2_COMPARE_TEMPLATE(date, timestamptz, __compare_date_timestamptz)
 PG_FLEXIBLE2_COMPARE_TEMPLATE(timestamptz, date, __compare_timestamptz_date)
@@ -2159,7 +2230,7 @@ __compare_timestamp_timestamptz(kern_context *kcxt,
 	else
 	{
 		tz = DetermineTimeZoneOffset(&tm, tz_info);
-		ts = a * USECS_PER_SEC + tz * USECS_PER_SEC;
+		ts = a + tz * USECS_PER_SEC;
 		if (ts < MIN_TIMESTAMP)
 			ts = DT_NOBEGIN;
 		else if (ts > END_TIMESTAMP)
@@ -2187,7 +2258,12 @@ __compare_interval(kern_context *kcxt, const Interval &lval, const Interval &rva
 	int128_t	lcmp = interval_cmp_value(&lval);
 	int128_t	rcmp = interval_cmp_value(&rval);
 
-	return (lcmp - rcmp);
+	if (lcmp < rcmp)
+		return -1;
+	else if (lcmp > rcmp)
+		return 1;
+	else
+		return 0;
 }
 PG_FLEXIBLE1_COMPARE_TEMPLATE(interval, __compare_interval)
 

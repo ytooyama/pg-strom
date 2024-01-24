@@ -2832,17 +2832,18 @@ pgfn_interval_mi(XPU_PGFUNCTION_ARGS)
 		result->value.month = ival1.value.month - ival2.value.month;
 		result->value.day   = ival1.value.day   - ival2.value.day;
 		result->value.time  = ival1.value.time  - ival2.value.time;
-		if ((SAMESIGN(ival1.value.month, ival2.value.month) &&
+		if ((!SAMESIGN(ival1.value.month, ival2.value.month) &&
 			 !SAMESIGN(result->value.month, ival1.value.month)) ||
-			(SAMESIGN(ival1.value.day, ival2.value.day) &&
+			(!SAMESIGN(ival1.value.day, ival2.value.day) &&
 			 !SAMESIGN(result->value.day, ival1.value.day)) ||
-			(SAMESIGN(ival1.value.time, ival2.value.time) &&
+			(!SAMESIGN(ival1.value.time, ival2.value.time) &&
 			 !SAMESIGN(result->value.time, ival1.value.time)))
 		{
 			STROM_ELOG(kcxt, "interval out of range");
 			return false;
 		}
 	}
+	return true;
 }
 
 #undef SAMESIGN
@@ -3101,7 +3102,7 @@ typedef struct
 } datetkn;
 #define TOKMAXLEN		10
 
-static __device__ const datetkn deltatktbl[] = {
+STATIC_DATA const datetkn deltatktbl[] = {
 	/* token, type, value */
 	{"@",		IGNORE_DTF, 0},		/* postgres relative prefix */
 	{"ago",		AGO, 0},			/* "ago" indicates negative time offset */
@@ -3176,7 +3177,7 @@ static __device__ const datetkn deltatktbl[] = {
 #define AD      0
 #define BC      1
 
-static __device__ const datetkn datetktbl[] = {
+STATIC_DATA const datetkn datetktbl[] = {
     /* token, type, value */
 	{"-infinity",	RESERV, DTK_EARLY},
 	{"ad",			ADBC, AD},           /* "ad" for years > 0 */
@@ -3289,11 +3290,12 @@ extract_decode_unit(kern_context *kcxt,
 					int *p_type, int *p_value)
 {
 	const datetkn *dtoken;
-	char	namebuf[24];
-	int		i;
+	char	namebuf[TOKMAXLEN+1];
+	int		i,n;
 
 	assert(key->length >= 0);
-	for (i=0; i < key->length; i++)
+	n = Min(key->length, TOKMAXLEN);
+	for (i=0; i < n; i++)
 	{
 		char	ch = key->value[i];
 
@@ -3363,7 +3365,7 @@ NonFiniteTimestampTzPart(kern_context *kcxt,
 							: XPU_NUMERIC_KIND__POS_INF);
 			break;
 		default:
-			STROM_ELOG(kcxt, "unsupported timestamp unit");
+			STROM_ELOG(kcxt, "not a supported unit for non-finite timestamp");
 			return false;
 	}
 	result->expr_ops = &xpu_numeric_ops;
@@ -3483,7 +3485,7 @@ __pg_extract_timestamp_common(kern_context *kcxt,
 			case DTK_TZ_MINUTE:
 			case DTK_TZ_HOUR:
 			default:
-				STROM_ELOG(kcxt, "unsupported unit of timestamp");
+				STROM_ELOG(kcxt, "not a supported unit for timestamp/timestamptz");
 				return false;
 		}
 	}
@@ -3501,13 +3503,13 @@ __pg_extract_timestamp_common(kern_context *kcxt,
 		}
 		else
 		{
-			STROM_ELOG(kcxt, "unsupported unit of timestamp");
+			STROM_ELOG(kcxt, "not a supported unit for timestamp/timestamptz");
 			return false;
 		}
 	}
 	else
 	{
-		STROM_ELOG(kcxt, "not recognized unit of timestamp");
+		STROM_ELOG(kcxt, "not recognized unit for timestamp/timestamptz");
 		return false;
 	}
 	return true;
@@ -3597,7 +3599,7 @@ pgfn_extract_date(XPU_PGFUNCTION_ARGS)
 					result->kind = XPU_NUMERIC_KIND__POS_INF;
 				break;
 			default:
-				STROM_ELOG(kcxt, "not a supported unit of date");
+				STROM_ELOG(kcxt, "not a supported unit for 'date' type");
 				return false;
 		}
 	}
@@ -3666,7 +3668,7 @@ pgfn_extract_date(XPU_PGFUNCTION_ARGS)
 								   date2j(year, 1, 1) + 1);
                 break;
 			default:
-				STROM_ELOG(kcxt, "not a not supported for date");
+				STROM_ELOG(kcxt, "not a supported unit for 'date' type");
 				return false;
 		}
 	}
@@ -3681,7 +3683,7 @@ pgfn_extract_date(XPU_PGFUNCTION_ARGS)
 	}
 	else
 	{
-		STROM_ELOG(kcxt, "not a recognized unit of time");
+		STROM_ELOG(kcxt, "not a recognized unit for 'date' type");
 		return false;
 	}
 	return true;
@@ -3731,7 +3733,7 @@ pgfn_extract_time(XPU_PGFUNCTION_ARGS)
 				result->u.value = tm.tm_hour;
 				break;
 			default:
-				STROM_ELOG(kcxt, "unsupported unit of time");
+				STROM_ELOG(kcxt, "not a supported unit for 'time' type");
 				return false;
 		}
 	}
@@ -3804,7 +3806,7 @@ pgfn_extract_timetz(XPU_PGFUNCTION_ARGS)
                 result->u.value = tm.tm_hour;
                 break;
 			default:
-				STROM_ELOG(kcxt, "unsupported unit of time");
+				STROM_ELOG(kcxt, "not a supported unit for 'time' type");
 				return false;
 		}
 	}
@@ -3908,7 +3910,7 @@ pgfn_extract_interval(XPU_PGFUNCTION_ARGS)
 				result->u.value = tm_year / 1000;
 				break;
 			default:
-				STROM_ELOG(kcxt, "not a supported for interval type");
+				STROM_ELOG(kcxt, "not a supported unit for 'interval' type");
 				return false;
 		}
 	}

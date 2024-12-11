@@ -68,7 +68,7 @@ xpu_date_datum_heap_read(kern_context *kcxt,
 	xpu_date_t *result = (xpu_date_t *)__result;
 
 	result->expr_ops = &xpu_date_ops;
-	result->value = *((const DateADT *)addr);
+	__FetchStore(result->value, (const DateADT *)addr);
 	return true;
 }
 
@@ -224,7 +224,7 @@ xpu_time_datum_heap_read(kern_context *kcxt,
 	xpu_time_t *result = (xpu_time_t *)__result;
 
 	result->expr_ops = &xpu_time_ops;
-	result->value = *((const TimeADT *)addr);
+	__FetchStore(result->value, (const TimeADT *)addr);
 	return true;
 }
 
@@ -517,7 +517,7 @@ xpu_timestamp_datum_heap_read(kern_context *kcxt,
 	xpu_timestamp_t *result = (xpu_timestamp_t *)__result;
 
 	result->expr_ops = &xpu_timestamp_ops;
-	result->value = *((int64_t *)addr);
+	__FetchStore(result->value, (int64_t *)addr);
 	return true;
 }
 
@@ -697,7 +697,7 @@ xpu_timestamptz_datum_heap_read(kern_context *kcxt,
 	xpu_timestamptz_t *result = (xpu_timestamptz_t *)__result;
 
 	result->expr_ops = &xpu_timestamptz_ops;
-	result->value = *((const TimestampTz *)addr);
+	__FetchStore(result->value, (const TimestampTz *)addr);
 	return true;
 }
 
@@ -871,19 +871,19 @@ PGSTROM_SQLTYPE_OPERATORS(timestamptz, true, 8, sizeof(TimestampTz));
  */
 
 /* definition copied from datetime.c */
-STATIC_DATA const int day_tab[2][13] =
+STATIC_DATA(const int, day_tab[2][13]) =
 {
     {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31, 0},
     {31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31, 0}
 };
 
 /* definition copied from pgtime.h */
-STATIC_DATA const int mon_lengths[2][MONSPERYEAR] = {
+STATIC_DATA(const int, mon_lengths[2][MONSPERYEAR]) = {
     {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31},
     {31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31}
 };
 
-STATIC_DATA const int year_lengths[2] = {
+STATIC_DATA(const int, year_lengths[2]) = {
     DAYSPERNYEAR, DAYSPERLYEAR
 };
 
@@ -2766,6 +2766,8 @@ pgfn_timestamptz_mi_interval(XPU_PGFUNCTION_ARGS)
 	return __pg_timestamptz_pl_interval(kcxt, result, &tval, &ival);
 }
 
+#define SAMESIGN(a,b)		(((a) < 0) == ((b) < 0))
+
 PUBLIC_FUNCTION(bool)
 pgfn_interval_um(XPU_PGFUNCTION_ARGS)
 {
@@ -2775,22 +2777,24 @@ pgfn_interval_um(XPU_PGFUNCTION_ARGS)
 		result->expr_ops = NULL;
 	else
 	{
-		if (ival.value.month   == -1 ||
-			ival.value.day     == -1 ||
-			result->value.time == -1L)
+		result->value.month = -ival.value.month;
+		result->value.day   = -ival.value.day;
+		result->value.time  = -ival.value.time;
+		if ((result->value.time  != 0 && SAMESIGN(ival.value.time,
+												  result->value.time)) ||
+			(result->value.day   != 0 && SAMESIGN(ival.value.day,
+												  result->value.day)) ||
+			(result->value.month != 0 && SAMESIGN(ival.value.month,
+												  result->value.month)))
 		{
 			STROM_ELOG(kcxt, "interval out of range");
 			return false;
 		}
-		result->value.month = -ival.value.month;
-		result->value.day   = -ival.value.day;
-		result->value.time  = -ival.value.time;
 		result->expr_ops    = &xpu_interval_ops;
 	}
 	return true;
 }
 
-#define SAMESIGN(a,b)		(((a) < 0) == ((b) < 0))
 
 PUBLIC_FUNCTION(bool)
 pgfn_interval_pl(XPU_PGFUNCTION_ARGS)
@@ -3102,7 +3106,7 @@ typedef struct
 } datetkn;
 #define TOKMAXLEN		10
 
-STATIC_DATA const datetkn deltatktbl[] = {
+STATIC_DATA(const datetkn, deltatktbl[]) = {
 	/* token, type, value */
 	{"@",		IGNORE_DTF, 0},		/* postgres relative prefix */
 	{"ago",		AGO, 0},			/* "ago" indicates negative time offset */
@@ -3177,7 +3181,7 @@ STATIC_DATA const datetkn deltatktbl[] = {
 #define AD      0
 #define BC      1
 
-STATIC_DATA const datetkn datetktbl[] = {
+STATIC_DATA(const datetkn, datetktbl[]) = {
     /* token, type, value */
 	{"-infinity",	RESERV, DTK_EARLY},
 	{"ad",			ADBC, AD},           /* "ad" for years > 0 */
@@ -3398,15 +3402,16 @@ __pg_extract_timestamp_common(kern_context *kcxt,
 		switch (value)
 		{
 			case DTK_MICROSEC:
-				result->u.value = tm.tm_sec * 1000000 + fsec;
-				result->weight = 6;
+				result->u.value = (int64_t)tm.tm_sec * 1000000L + fsec;
+				//result->weight = 0;
 				break;
 			case DTK_MILLISEC:
-				result->u.value = tm.tm_sec * 1000 + fsec / 1000.0;
+				result->u.value = (int64_t)tm.tm_sec * 1000000L + fsec;
 				result->weight = 3;
 				break;
 			case DTK_SECOND:
-				result->u.value = tm.tm_sec;
+				result->u.value = (int64_t)tm.tm_sec * 1000000L + fsec;
+				result->weight = 6;
 				break;
 			case DTK_MINUTE:
 				result->u.value = tm.tm_min;
@@ -3482,8 +3487,23 @@ __pg_extract_timestamp_common(kern_context *kcxt,
 								   date2j(tm.tm_year, 1, 1) + 1);
 				break;
 			case DTK_TZ:
+				if (tz_info)
+				{
+					result->u.value = tm.tm_gmtoff;
+					break;
+				}
 			case DTK_TZ_MINUTE:
+				if (tz_info)
+				{
+					result->u.value = (tm.tm_gmtoff / SECS_PER_MINUTE) % MINS_PER_HOUR;
+					break;
+				}
 			case DTK_TZ_HOUR:
+				if (tz_info)
+				{
+					result->u.value = (tm.tm_gmtoff / SECS_PER_HOUR);
+					break;
+				}
 			default:
 				STROM_ELOG(kcxt, "not a supported unit for timestamp/timestamptz");
 				return false;

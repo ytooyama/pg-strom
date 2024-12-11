@@ -98,6 +98,32 @@ get_next_log2(Size size)
 }
 
 /*
+ * get_next_log2
+ *
+ * It returns N of the least 2^N value that is larger than or equal to
+ * the supplied value.
+ */
+static inline int
+get_bitcount(unsigned long val)
+{
+#ifdef	__GNUC__
+	return __builtin_popcountl(val);
+#else
+	static int __bitcount_4bit[16] = {
+		0,1,1,2, 1,2,2,3, 1,2,2,3, 2,3,3,4
+	};
+	int		count = 0;
+
+	while (val != 0)
+	{
+		count += __bitcount_4bit[(val & 0x0f)];
+		val >>= 4;
+	}
+	return count;
+#endif	/* !__GNUC__ */
+}
+
+/*
  * __trim - remove whitespace at the head/tail of cstring
  */
 static inline char *
@@ -110,6 +136,79 @@ __trim(char *token)
 	while (tail >= token && isspace(*tail))
 		*tail-- = '\0';
 	return token;
+}
+
+/*
+ * __strtol / __strtoul / __strtosz - set errno if token is not pure digits
+ */
+static inline long int
+__strtol(const char *token)
+{
+	long int ival;
+	char   *end;
+
+	errno = 0;		/* clear */
+	ival = strtol(token, &end, 10);
+	if (*end != '\0')
+		errno = EINVAL;
+	return ival;
+}
+
+static inline unsigned long int
+__strtoul(const char *token)
+{
+	unsigned long int ival;
+	char   *end;
+
+	errno = 0;		/* clear */
+	ival = strtoul(token, &end, 10);
+	if (*end != '\0')
+		errno = EINVAL;
+	return ival;
+}
+
+static inline size_t
+__strtosz(const char *token)
+{
+	size_t	sz;
+	char   *end;
+
+	errno = 0;		/* clear */
+	sz = strtoul(token, &end, 10);
+	if (errno == 0)
+	{
+		if (strcasecmp(end, "t") == 0 || strcasecmp(end, "tb") == 0)
+		{
+			if (sz > 0x0000000000ffffffUL)
+				errno = ERANGE;
+			else
+				sz <<= 40;
+		}
+		else if (strcasecmp(end, "g") == 0 || strcasecmp(end, "gb") == 0)
+		{
+			if (sz > 0x00000003ffffffffUL)
+				errno = ERANGE;
+			else
+				sz <<= 30;
+		}
+		else if (strcasecmp(end, "m") == 0 || strcasecmp(end, "mb") == 0)
+		{
+			if (sz > 0x00000fffffffffffUL)
+				errno = ERANGE;
+			else
+				sz <<= 20;
+		}
+		else if (strcasecmp(end, "k") == 0 || strcasecmp(end, "kb") == 0)
+		{
+			if (sz > 0x003fffffffffffffUL)
+				errno = ERANGE;
+			else
+				sz <<= 10;
+		}
+		else if (*end != '\0')
+			errno = EINVAL;
+	}
+	return sz;
 }
 
 /* lappend on the specified memory-context */
@@ -137,46 +236,40 @@ initStringInfoCxt(MemoryContext memcxt, StringInfo buf)
 }
 
 /*
- * formater of numeric/bytesz/millisec
+ * formater of bytesz/millisec
  */
 static inline char *
-format_numeric(int64 value)
-{
-	if (value > 8000000000000L   || value < -8000000000000L)
-		return psprintf("%.2fT", (double)value / 1000000000000.0);
-	else if (value > 8000000000L || value < -8000000000L)
-		return psprintf("%.2fG", (double)value / 1000000000.0);
-	else if (value > 8000000L    || value < -8000000L)
-		return psprintf("%.2fM", (double)value / 1000000.0);
-	else if (value > 8000L       || value < -8000L)
-		return psprintf("%.2fK", (double)value / 1000.0);
-	else
-		return psprintf("%ld", value);
-}
-
-static inline char *
-format_bytesz(size_t nbytes)
+__format_bytesz(char *buffer, size_t bufsz, size_t nbytes)
 {
 	if (nbytes > (1UL<<43))
-		return psprintf("%.2fTB", (double)nbytes / (double)(1UL<<40));
+		snprintf(buffer, bufsz, "%.2fTB", (double)nbytes / (double)(1UL<<40));
 	else if (nbytes > (1UL<<33))
-		return psprintf("%.2fGB", (double)nbytes / (double)(1UL<<30));
+		snprintf(buffer, bufsz, "%.2fGB", (double)nbytes / (double)(1UL<<30));
 	else if (nbytes > (1UL<<23))
-		return psprintf("%.2fMB", (double)nbytes / (double)(1UL<<20));
+		snprintf(buffer, bufsz, "%.2fMB", (double)nbytes / (double)(1UL<<20));
 	else if (nbytes > (1UL<<13))
-		return psprintf("%.2fKB", (double)nbytes / (double)(1UL<<10));
-	return psprintf("%uB", (unsigned int)nbytes);
+		snprintf(buffer, bufsz, "%.2fKB", (double)nbytes / (double)(1UL<<10));
+	else
+		snprintf(buffer, bufsz, "%uB", (unsigned int)nbytes);
+	return buffer;
 }
+#define format_bytesz(nbytes)	\
+	__format_bytesz(alloca(40), 40, (nbytes))
 
 static inline char *
-format_millisec(double milliseconds)
+__format_millisec(char *buffer, size_t bufsz, double msec)
 {
-	if (milliseconds > 300000.0)    /* more then 5min */
-		return psprintf("%.2fmin", milliseconds / 60000.0);
-	else if (milliseconds > 8000.0) /* more than 8sec */
-		return psprintf("%.2fsec", milliseconds / 1000.0);
-	return psprintf("%.2fms", milliseconds);
+	if (msec > 300000.0)	/* more than 5min */
+		snprintf(buffer, bufsz, "%.2fmin", msec / 60000.0);
+	else if (msec > 8000.0)
+		snprintf(buffer, bufsz, "%.2fsec", msec / 1000.0);
+	else
+		snprintf(buffer, bufsz, "%.0fmsec", msec);
+
+	return buffer;
 }
+#define format_millisec(msec)					\
+	__format_millisec(alloca(40), 40, (msec))
 
 /*
  * pmemdup
@@ -432,11 +525,11 @@ dump_tuple_desc(const TupleDesc tdesc)
 INLINE_FUNCTION(void)
 dump_kern_data_store(const kern_data_store *kds)
 {
-	fprintf(stderr, "kds %p { length=%lu, nitems=%u, usage=%u, ncols=%u, format=%c, has_varlena=%c, tdhasoid=%c, tdtypeid=%u, tdtypmod=%d, table_oid=%u, hash_nslots=%u, block_offset=%u, block_nloaded=%u, nr_colmeta=%u }\n",
+	fprintf(stderr, "kds %p { length=%lu, usage=%lu, nitems=%u, ncols=%u, format=%c, has_varlena=%c, tdhasoid=%c, tdtypeid=%u, tdtypmod=%d, table_oid=%u, hash_nslots=%u, block_offset=%u, block_nloaded=%u, nr_colmeta=%u }\n",
 			kds,
 			kds->length,
-			kds->nitems,
 			kds->usage,
+			kds->nitems,
 			kds->ncols,
 			kds->format,
 			kds->has_varlena ? 't' : 'f',

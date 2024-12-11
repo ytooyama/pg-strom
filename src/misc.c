@@ -18,64 +18,84 @@
  *
  * ----------------------------------------------------------------
  */
-static List *
-__form_codegen_kvar_defitem(codegen_kvar_defitem *kvdef)
+static void
+__form_codegen_kvar_defitem(codegen_kvar_defitem *kvdef,
+							List **p__kv_privs,
+							List **p__kv_exprs)
 {
-	List	   *result = NIL;
-	List	   *subfields = NIL;
+	List	   *__kv_privs = NIL;
+	List	   *__kv_exprs = NIL;
+	List	   *__sub_privs = NIL;
+	List	   *__sub_exprs = NIL;
 	ListCell   *lc;
 
-	result = lappend(result, makeInteger(kvdef->kv_slot_id));
-	result = lappend(result, makeInteger(kvdef->kv_depth));
-	result = lappend(result, makeInteger(kvdef->kv_resno));
-	result = lappend(result, makeInteger(kvdef->kv_maxref));
-	result = lappend(result, makeInteger(kvdef->kv_offset));
+	__kv_privs = lappend(__kv_privs, makeInteger(kvdef->kv_slot_id));
+	__kv_privs = lappend(__kv_privs, makeInteger(kvdef->kv_depth));
+	__kv_privs = lappend(__kv_privs, makeInteger(kvdef->kv_resno));
+	__kv_privs = lappend(__kv_privs, makeInteger(kvdef->kv_maxref));
+	__kv_privs = lappend(__kv_privs, makeInteger(kvdef->kv_offset));
 
-	result = lappend(result, makeInteger(kvdef->kv_type_oid));
-	result = lappend(result, makeInteger(kvdef->kv_type_code));
-	result = lappend(result, makeBoolean(kvdef->kv_typbyval));
-	result = lappend(result, makeInteger(kvdef->kv_typalign));
-	result = lappend(result, makeInteger(kvdef->kv_typlen));
-	result = lappend(result, makeInteger(kvdef->kv_kvec_sizeof));
-	result = lappend(result, kvdef->kv_expr);
+	__kv_privs = lappend(__kv_privs, makeInteger(kvdef->kv_type_oid));
+	__kv_privs = lappend(__kv_privs, makeInteger(kvdef->kv_type_code));
+	__kv_privs = lappend(__kv_privs, makeBoolean(kvdef->kv_typbyval));
+	__kv_privs = lappend(__kv_privs, makeInteger(kvdef->kv_typalign));
+	__kv_privs = lappend(__kv_privs, makeInteger(kvdef->kv_typlen));
+	__kv_privs = lappend(__kv_privs, makeInteger(kvdef->kv_xdatum_sizeof));
+	__kv_privs = lappend(__kv_privs, makeInteger(kvdef->kv_kvec_sizeof));
+	__kv_privs = lappend(__kv_privs, makeInteger(kvdef->kv_fallback));
+	__kv_exprs = lappend(__kv_exprs, kvdef->kv_expr);
 	foreach (lc, kvdef->kv_subfields)
 	{
 		codegen_kvar_defitem *__kvdef = lfirst(lc);
-		subfields = lappend(subfields, __form_codegen_kvar_defitem(__kvdef));
-	}
-	result = lappend(result, subfields);
+		List   *__privs = NIL;
+		List   *__exprs = NIL;
 
-	return result;
+		__form_codegen_kvar_defitem(__kvdef, &__privs, &__exprs);
+		__sub_privs = lappend(__sub_privs, __privs);
+		__sub_exprs = lappend(__sub_exprs, __exprs);
+	}
+	__kv_privs = lappend(__kv_privs, __sub_privs);
+	__kv_exprs = lappend(__kv_exprs, __sub_exprs);
+
+	*p__kv_privs = __kv_privs;
+	*p__kv_exprs = __kv_exprs;
 }
 
 static codegen_kvar_defitem *
-__deform_codegen_kvar_defitem(List *sublist)
+__deform_codegen_kvar_defitem(List *__kv_privs, List *__kv_exprs)
 {
 	codegen_kvar_defitem *kvdef = palloc0(sizeof(codegen_kvar_defitem));
-	List	   *subfields = NIL;
-	ListCell   *lc;
-	int			kvindex = 0;
+	List	   *__sub_privs = NIL;
+	List	   *__sub_exprs = NIL;
+	ListCell   *lc1, *lc2;
+	int			pindex = 0;
+	int			eindex = 0;
 
-	kvdef->kv_slot_id  = intVal(list_nth(sublist, kvindex++));
-	kvdef->kv_depth    = intVal(list_nth(sublist, kvindex++));
-	kvdef->kv_resno    = intVal(list_nth(sublist, kvindex++));
-	kvdef->kv_maxref   = intVal(list_nth(sublist, kvindex++));
-	kvdef->kv_offset   = intVal(list_nth(sublist, kvindex++));
+	kvdef->kv_slot_id   = intVal(list_nth(__kv_privs, pindex++));
+	kvdef->kv_depth     = intVal(list_nth(__kv_privs, pindex++));
+	kvdef->kv_resno     = intVal(list_nth(__kv_privs, pindex++));
+	kvdef->kv_maxref    = intVal(list_nth(__kv_privs, pindex++));
+	kvdef->kv_offset    = intVal(list_nth(__kv_privs, pindex++));
 
-	kvdef->kv_type_oid = intVal(list_nth(sublist, kvindex++));
-	kvdef->kv_type_code = intVal(list_nth(sublist, kvindex++));
-	kvdef->kv_typbyval = boolVal(list_nth(sublist, kvindex++));
-	kvdef->kv_typalign = intVal(list_nth(sublist, kvindex++));
-	kvdef->kv_typlen   = intVal(list_nth(sublist, kvindex++));
-	kvdef->kv_kvec_sizeof = intVal(list_nth(sublist, kvindex++));
-	kvdef->kv_expr     = list_nth(sublist, kvindex++);
-	subfields          = list_nth(sublist, kvindex++);
-	foreach (lc, subfields)
+	kvdef->kv_type_oid  = intVal(list_nth(__kv_privs, pindex++));
+	kvdef->kv_type_code = intVal(list_nth(__kv_privs, pindex++));
+	kvdef->kv_typbyval  = boolVal(list_nth(__kv_privs, pindex++));
+	kvdef->kv_typalign  = intVal(list_nth(__kv_privs, pindex++));
+	kvdef->kv_typlen    = intVal(list_nth(__kv_privs, pindex++));
+	kvdef->kv_xdatum_sizeof = intVal(list_nth(__kv_privs, pindex++));
+	kvdef->kv_kvec_sizeof = intVal(list_nth(__kv_privs, pindex++));
+	kvdef->kv_fallback  = intVal(list_nth(__kv_privs, pindex++));
+	kvdef->kv_expr      = list_nth(__kv_exprs, eindex++);
+	__sub_privs         = list_nth(__kv_privs, pindex++);
+	__sub_exprs         = list_nth(__kv_exprs, eindex++);
+	forboth (lc1, __sub_privs,
+			 lc2, __sub_exprs)
 	{
-		List   *__sublist = lfirst(lc);
+		codegen_kvar_defitem *__kvdef;
 
-		kvdef->kv_subfields = lappend(kvdef->kv_subfields,
-									  __deform_codegen_kvar_defitem(__sublist));
+		__kvdef = __deform_codegen_kvar_defitem(lfirst(lc1),
+												lfirst(lc2));
+		kvdef->kv_subfields = lappend(kvdef->kv_subfields, __kvdef);
 	}
 	return kvdef;
 }
@@ -85,13 +105,12 @@ form_pgstrom_plan_info(CustomScan *cscan, pgstromPlanInfo *pp_info)
 {
 	List	   *privs = NIL;
 	List	   *exprs = NIL;
-	List	   *kvars_deflist = NIL;
+	List	   *kvars_deflist_privs = NIL;
+	List	   *kvars_deflist_exprs = NIL;
 	ListCell   *lc;
 	int			endpoint_id;
 
 	privs = lappend(privs, makeInteger(pp_info->xpu_task_flags));
-	privs = lappend(privs, makeInteger(pp_info->gpu_cache_dindex));
-	privs = lappend(privs, bms_to_pglist(pp_info->gpu_direct_devs));
 	endpoint_id = DpuStorageEntryGetEndpointId(pp_info->ds_entry);
 	privs = lappend(privs, makeInteger(endpoint_id));
 	/* plan information */
@@ -99,14 +118,16 @@ form_pgstrom_plan_info(CustomScan *cscan, pgstromPlanInfo *pp_info)
 	exprs = lappend(exprs, pp_info->used_params);
 	privs = lappend(privs, pp_info->host_quals);
 	privs = lappend(privs, makeInteger(pp_info->scan_relid));
-	privs = lappend(privs, pp_info->scan_quals);
+	exprs = lappend(exprs, pp_info->scan_quals);
 	privs = lappend(privs, __makeFloat(pp_info->scan_tuples));
-	privs = lappend(privs, __makeFloat(pp_info->scan_rows));
-	privs = lappend(privs, __makeFloat(pp_info->scan_startup_cost));
-	privs = lappend(privs, __makeFloat(pp_info->scan_run_cost));
+	privs = lappend(privs, __makeFloat(pp_info->scan_nrows));
 	privs = lappend(privs, makeInteger(pp_info->parallel_nworkers));
 	privs = lappend(privs, __makeFloat(pp_info->parallel_divisor));
+	privs = lappend(privs, __makeFloat(pp_info->startup_cost));
+	privs = lappend(privs, __makeFloat(pp_info->inner_cost));
+	privs = lappend(privs, __makeFloat(pp_info->run_cost));
 	privs = lappend(privs, __makeFloat(pp_info->final_cost));
+	privs = lappend(privs, __makeFloat(pp_info->final_nrows));
 	/* bin-index support */
 	privs = lappend(privs, makeInteger(pp_info->brin_index_oid));
 	privs = lappend(privs, pp_info->brin_index_conds);
@@ -127,47 +148,52 @@ form_pgstrom_plan_info(CustomScan *cscan, pgstromPlanInfo *pp_info)
 	foreach (lc, pp_info->kvars_deflist)
 	{
 		codegen_kvar_defitem *kvdef = lfirst(lc);
+		List   *__kv_privs = NIL;
+		List   *__kv_exprs = NIL;
 
-		kvars_deflist = lappend(kvars_deflist, __form_codegen_kvar_defitem(kvdef));
+		__form_codegen_kvar_defitem(kvdef, &__kv_privs, &__kv_exprs);
+		kvars_deflist_privs = lappend(kvars_deflist_privs, __kv_privs);
+		kvars_deflist_exprs = lappend(kvars_deflist_exprs, __kv_exprs);
 	}
 	/* other planner fields */
-	privs = lappend(privs, kvars_deflist);
+	privs = lappend(privs, kvars_deflist_privs);
+	exprs = lappend(exprs, kvars_deflist_exprs);
 	privs = lappend(privs, makeInteger(pp_info->kvecs_bufsz));
 	privs = lappend(privs, makeInteger(pp_info->kvecs_ndims));
-	privs = lappend(privs, makeInteger(pp_info->extra_flags));
 	privs = lappend(privs, makeInteger(pp_info->extra_bufsz));
-	privs = lappend(privs, pp_info->fallback_tlist);
+	privs = lappend(privs, makeInteger(pp_info->cuda_stack_size));
 	privs = lappend(privs, pp_info->groupby_actions);
+	privs = lappend(privs, pp_info->groupby_typmods);
 	privs = lappend(privs, makeInteger(pp_info->groupby_prepfn_bufsz));
+	exprs = lappend(exprs, pp_info->projection_hashkeys);
 	/* inner relations */
+	privs = lappend(privs, makeInteger(pp_info->sibling_param_id));
 	privs = lappend(privs, makeInteger(pp_info->num_rels));
 	for (int i=0; i < pp_info->num_rels; i++)
 	{
 		pgstromPlanInnerInfo *pp_inner = &pp_info->inners[i];
+		List   *__exprs = NIL;
 		List   *__privs = NIL;
 
 		__privs = lappend(__privs, makeInteger(pp_inner->join_type));
 		__privs = lappend(__privs, __makeFloat(pp_inner->join_nrows));
-		__privs = lappend(__privs, __makeFloat(pp_inner->join_startup_cost));
-		__privs = lappend(__privs, __makeFloat(pp_inner->join_run_cost));
-		__privs = lappend(__privs, pp_inner->hash_outer_keys_original);
-		__privs = lappend(__privs, pp_inner->hash_outer_keys_fallback);
-		__privs = lappend(__privs, pp_inner->hash_inner_keys_original);
-		__privs = lappend(__privs, pp_inner->hash_inner_keys_fallback);
-		__privs = lappend(__privs, pp_inner->join_quals_original);
-		__privs = lappend(__privs, pp_inner->join_quals_fallback);
-		__privs = lappend(__privs, pp_inner->other_quals_original);
-		__privs = lappend(__privs, pp_inner->other_quals_fallback);
+		__exprs = lappend(__exprs, pp_inner->hash_outer_keys);
+		__exprs = lappend(__exprs, pp_inner->hash_inner_keys);
+		__exprs = lappend(__exprs, pp_inner->join_quals);
+		__exprs = lappend(__exprs, pp_inner->other_quals);
 		__privs = lappend(__privs, makeInteger(pp_inner->gist_index_oid));
 		__privs = lappend(__privs, makeInteger(pp_inner->gist_index_col));
 		__privs = lappend(__privs, makeInteger(pp_inner->gist_ctid_resno));
 		__privs = lappend(__privs, makeInteger(pp_inner->gist_func_oid));
 		__privs = lappend(__privs, makeInteger(pp_inner->gist_slot_id));
-		__privs = lappend(__privs, pp_inner->gist_clause);
+		__exprs = lappend(__exprs, pp_inner->gist_clause);
 		__privs = lappend(__privs, __makeFloat(pp_inner->gist_selectivity));
 		__privs = lappend(__privs, __makeFloat(pp_inner->gist_npages));
 		__privs = lappend(__privs, makeInteger(pp_inner->gist_height));
+		__privs = lappend(__privs, makeBoolean(pp_inner->inner_pinned_buffer));
+		__privs = lappend(__privs, makeInteger(pp_inner->inner_partitions_divisor));
 
+		exprs = lappend(exprs, __exprs);
 		privs = lappend(privs, __privs);
 	}
 	cscan->custom_exprs = exprs;
@@ -186,30 +212,31 @@ deform_pgstrom_plan_info(CustomScan *cscan)
 	List	   *exprs = cscan->custom_exprs;
 	int			pindex = 0;
 	int			eindex = 0;
-	List	   *kvars_deflist;
-	ListCell   *lc;
+	List	   *kvars_deflist_privs;
+	List	   *kvars_deflist_exprs;
+	ListCell   *lc1, *lc2;
 	int			endpoint_id;
 
 	memset(&pp_data, 0, sizeof(pgstromPlanInfo));
 	/* device identifiers */
 	pp_data.xpu_task_flags = intVal(list_nth(privs, pindex++));
-	pp_data.gpu_cache_dindex = intVal(list_nth(privs, pindex++));
-	pp_data.gpu_direct_devs = bms_from_pglist(list_nth(privs, pindex++));
 	endpoint_id = intVal(list_nth(privs, pindex++));
 	pp_data.ds_entry = DpuStorageEntryByEndpointId(endpoint_id);
 	/* plan information */
-	pp_data.outer_refs = bms_from_pglist(list_nth(privs, pindex++));
-	pp_data.used_params = list_nth(exprs, eindex++);
-	pp_data.host_quals = list_nth(privs, pindex++);
-	pp_data.scan_relid = intVal(list_nth(privs, pindex++));
-	pp_data.scan_quals = list_nth(privs, pindex++);
-	pp_data.scan_tuples = floatVal(list_nth(privs, pindex++));
-	pp_data.scan_rows = floatVal(list_nth(privs, pindex++));
-	pp_data.scan_startup_cost = floatVal(list_nth(privs, pindex++));
-	pp_data.scan_run_cost = floatVal(list_nth(privs, pindex++));
+	pp_data.outer_refs   = bms_from_pglist(list_nth(privs, pindex++));
+	pp_data.used_params  = list_nth(exprs, eindex++);
+	pp_data.host_quals   = list_nth(privs, pindex++);
+	pp_data.scan_relid   = intVal(list_nth(privs, pindex++));
+	pp_data.scan_quals   = list_nth(exprs, eindex++);
+	pp_data.scan_tuples  = floatVal(list_nth(privs, pindex++));
+	pp_data.scan_nrows   = floatVal(list_nth(privs, pindex++));
 	pp_data.parallel_nworkers = intVal(list_nth(privs, pindex++));
 	pp_data.parallel_divisor = floatVal(list_nth(privs, pindex++));
-	pp_data.final_cost = floatVal(list_nth(privs, pindex++));
+	pp_data.startup_cost = floatVal(list_nth(privs, pindex++));
+	pp_data.inner_cost   = floatVal(list_nth(privs, pindex++));
+	pp_data.run_cost     = floatVal(list_nth(privs, pindex++));
+	pp_data.final_cost   = floatVal(list_nth(privs, pindex++));
+	pp_data.final_nrows  = floatVal(list_nth(privs, pindex++));
 	/* brin-index support */
 	pp_data.brin_index_oid = intVal(list_nth(privs, pindex++));
 	pp_data.brin_index_conds = list_nth(privs, pindex++);
@@ -227,52 +254,56 @@ deform_pgstrom_plan_info(CustomScan *cscan)
 	pp_data.kexp_groupby_keycomp   = __getByteaConst(list_nth(privs, pindex++));
 	pp_data.kexp_groupby_actions   = __getByteaConst(list_nth(privs, pindex++));
 	/* Kvars definitions */
-	kvars_deflist = list_nth(privs, pindex++);
-	foreach (lc, kvars_deflist)
+	kvars_deflist_privs = list_nth(privs, pindex++);
+	kvars_deflist_exprs = list_nth(exprs, eindex++);
+	Assert(list_length(kvars_deflist_privs) == list_length(kvars_deflist_exprs));
+	forboth (lc1, kvars_deflist_privs,
+			 lc2, kvars_deflist_exprs)
 	{
-		List	   *sublist = (List *)lfirst(lc);
+		codegen_kvar_defitem *kvdef;
 
-		pp_data.kvars_deflist = lappend(pp_data.kvars_deflist,
-										__deform_codegen_kvar_defitem(sublist));
+		kvdef = __deform_codegen_kvar_defitem(lfirst(lc1),
+											  lfirst(lc2));
+		pp_data.kvars_deflist = lappend(pp_data.kvars_deflist, kvdef);
 	}
 	pp_data.kvecs_bufsz = intVal(list_nth(privs, pindex++));
 	pp_data.kvecs_ndims = intVal(list_nth(privs, pindex++));
-	pp_data.extra_flags = intVal(list_nth(privs, pindex++));
 	pp_data.extra_bufsz = intVal(list_nth(privs, pindex++));
-	pp_data.fallback_tlist = list_nth(privs, pindex++);
+	pp_data.cuda_stack_size = intVal(list_nth(privs, pindex++));
 	pp_data.groupby_actions = list_nth(privs, pindex++);
-	pp_data.groupby_prepfn_bufsz  = intVal(list_nth(privs, pindex++));
+	pp_data.groupby_typmods = list_nth(privs, pindex++);
+	pp_data.groupby_prepfn_bufsz = intVal(list_nth(privs, pindex++));
+	pp_data.projection_hashkeys = list_nth(exprs, eindex++);
 	/* inner relations */
+	pp_data.sibling_param_id = intVal(list_nth(privs, pindex++));
 	pp_data.num_rels = intVal(list_nth(privs, pindex++));
 	pp_info = palloc0(offsetof(pgstromPlanInfo, inners[pp_data.num_rels]));
 	memcpy(pp_info, &pp_data, offsetof(pgstromPlanInfo, inners));
 	for (int i=0; i < pp_info->num_rels; i++)
 	{
 		pgstromPlanInnerInfo *pp_inner = &pp_info->inners[i];
+		List   *__exprs = list_nth(exprs, eindex++);
 		List   *__privs = list_nth(privs, pindex++);
+		int		__eindex = 0;
 		int		__pindex = 0;
 
 		pp_inner->join_type       = intVal(list_nth(__privs, __pindex++));
 		pp_inner->join_nrows      = floatVal(list_nth(__privs, __pindex++));
-		pp_inner->join_startup_cost = floatVal(list_nth(__privs, __pindex++));
-		pp_inner->join_run_cost   = floatVal(list_nth(__privs, __pindex++));
-		pp_inner->hash_outer_keys_original = list_nth(__privs, __pindex++);
-		pp_inner->hash_outer_keys_fallback = list_nth(__privs, __pindex++);
-		pp_inner->hash_inner_keys_original = list_nth(__privs, __pindex++);
-		pp_inner->hash_inner_keys_fallback = list_nth(__privs, __pindex++);
-		pp_inner->join_quals_original = list_nth(__privs, __pindex++);
-		pp_inner->join_quals_fallback = list_nth(__privs, __pindex++);
-		pp_inner->other_quals_original = list_nth(__privs, __pindex++);
-		pp_inner->other_quals_fallback = list_nth(__privs, __pindex++);
+		pp_inner->hash_outer_keys = list_nth(__exprs, __eindex++);
+		pp_inner->hash_inner_keys = list_nth(__exprs, __eindex++);
+		pp_inner->join_quals      = list_nth(__exprs, __eindex++);
+		pp_inner->other_quals     = list_nth(__exprs, __eindex++);
 		pp_inner->gist_index_oid  = intVal(list_nth(__privs, __pindex++));
 		pp_inner->gist_index_col  = intVal(list_nth(__privs, __pindex++));
 		pp_inner->gist_ctid_resno = intVal(list_nth(__privs, __pindex++));
 		pp_inner->gist_func_oid   = intVal(list_nth(__privs, __pindex++));
 		pp_inner->gist_slot_id    = intVal(list_nth(__privs, __pindex++));
-		pp_inner->gist_clause     = list_nth(__privs, __pindex++);
+		pp_inner->gist_clause     = list_nth(__exprs, __eindex++);
 		pp_inner->gist_selectivity = floatVal(list_nth(__privs, __pindex++));
 		pp_inner->gist_npages     = floatVal(list_nth(__privs, __pindex++));
 		pp_inner->gist_height     = intVal(list_nth(__privs, __pindex++));
+		pp_inner->inner_pinned_buffer = boolVal(list_nth(__privs, __pindex++));
+		pp_inner->inner_partitions_divisor = intVal(list_nth(__privs, __pindex++));
 	}
 	return pp_info;
 }
@@ -284,6 +315,7 @@ pgstromPlanInfo *
 copy_pgstrom_plan_info(const pgstromPlanInfo *pp_orig)
 {
 	pgstromPlanInfo *pp_dest;
+	List	   *kvars_deflist = NIL;
 	ListCell   *lc;
 
 	/*
@@ -304,141 +336,158 @@ copy_pgstrom_plan_info(const pgstromPlanInfo *pp_orig)
 
 		kvdef_dest = pmemdup(kvdef_orig, sizeof(codegen_kvar_defitem));
 		kvdef_dest->kv_expr = copyObject(kvdef_dest->kv_expr);
-		pp_dest->kvars_deflist = lappend(pp_dest->kvars_deflist, kvdef_dest);
+		kvars_deflist = lappend(kvars_deflist, kvdef_dest);
 	}
-	pp_dest->fallback_tlist   = copyObject(pp_dest->fallback_tlist);
+	pp_dest->kvars_deflist    = kvars_deflist;
 	pp_dest->groupby_actions  = list_copy(pp_dest->groupby_actions);
+	pp_dest->groupby_typmods  = list_copy(pp_dest->groupby_typmods);
+	pp_dest->projection_hashkeys = copyObject(pp_dest->projection_hashkeys);
 	for (int j=0; j < pp_orig->num_rels; j++)
 	{
 		pgstromPlanInnerInfo *pp_inner = &pp_dest->inners[j];
-#define __COPY(FIELD)	pp_inner->FIELD = copyObject(pp_inner->FIELD)
-		__COPY(hash_outer_keys_original);
-		__COPY(hash_outer_keys_fallback);
-		__COPY(hash_inner_keys_original);
-		__COPY(hash_inner_keys_fallback);
-		__COPY(join_quals_original);
-		__COPY(join_quals_fallback);
-		__COPY(other_quals_original);
-		__COPY(other_quals_fallback);
-		__COPY(gist_clause);
-#undef __COPY
+
+		pp_inner->hash_outer_keys = copyObject(pp_inner->hash_outer_keys);
+		pp_inner->hash_inner_keys = copyObject(pp_inner->hash_inner_keys);
+		pp_inner->join_quals      = copyObject(pp_inner->join_quals);
+		pp_inner->other_quals     = copyObject(pp_inner->other_quals);
+		pp_inner->gist_clause     = copyObject(pp_inner->gist_clause);
 	}
 	return pp_dest;
 }
 
-#if 0
 /*
- * find_appinfos_by_relids_nofail
- *
- * It is almost equivalent to find_appinfos_by_relids(), but ignores
- * relations that are not partition leafs, instead of ereport().
- * In addition, it tries to solve multi-leve parent-child relations.
+ * fixup_scanstate_expressions
  */
-static AppendRelInfo *
-build_multilevel_appinfos(PlannerInfo *root,
-						  AppendRelInfo **appstack, int nlevels)
+static Node *
+__fixup_customscan_expressions_walker(Node *node, void *__priv)
 {
-	AppendRelInfo *apinfo = appstack[nlevels-1];
-	AppendRelInfo *apleaf = appstack[0];
-	AppendRelInfo *result;
-	ListCell   *lc;
-	int			i;
-
-	foreach (lc, root->append_rel_list)
+	if (!node)
+		return NULL;
+	if (IsA(node, Var))
 	{
-		AppendRelInfo *aptemp = lfirst(lc);
+		CustomScan *cscan = (CustomScan *)__priv;
+		Var	   *var = (Var *)node;
 
-		if (aptemp->child_relid == apinfo->parent_relid)
+		if (var->varno == INDEX_VAR)
 		{
-			appstack[nlevels] = aptemp;
-			return build_multilevel_appinfos(root, appstack, nlevels+1);
+			if (var->varattno > 0 &&
+				var->varattno <= list_length(cscan->custom_scan_tlist))
+			{
+				TargetEntry *tle = list_nth(cscan->custom_scan_tlist,
+											var->varattno - 1);
+				Assert(var->vartype   == exprType((Node *)tle->expr) &&
+					   var->vartypmod == exprTypmod((Node *)tle->expr));
+				return copyObject((Node *)tle->expr);
+			}
+			else
+			{
+				elog(ERROR, "Bug? INDEX_VAR referenced out of the custom_scan_tlist");
+			}
+		}
+		else
+		{
+			Assert(!IS_SPECIAL_VARNO(var->varno));
+			Assert(cscan->custom_scan_tlist == NIL);
+			return copyObject(node);
 		}
 	}
-	/* shortcut if a simple single-level relationship */
-	if (nlevels == 1)
-		return apinfo;
-
-	result = makeNode(AppendRelInfo);
-	result->parent_relid = apinfo->parent_relid;
-	result->child_relid = apleaf->child_relid;
-	result->parent_reltype = apinfo->parent_reltype;
-	result->child_reltype = apleaf->child_reltype;
-	foreach (lc, apinfo->translated_vars)
-	{
-		Var	   *var = lfirst(lc);
-
-		for (i=nlevels-1; i>=0; i--)
-		{
-			AppendRelInfo *apcurr = appstack[i];
-			Var	   *temp;
-
-			if (var->varattno > list_length(apcurr->translated_vars))
-				elog(ERROR, "attribute %d of relation \"%s\" does not exist",
-					 var->varattno, get_rel_name(apcurr->parent_reloid));
-			temp = list_nth(apcurr->translated_vars, var->varattno - 1);
-			if (!temp)
-				elog(ERROR, "attribute %d of relation \"%s\" does not exist",
-					 var->varattno, get_rel_name(apcurr->parent_reloid));
-			var = temp;
-		}
-		result->translated_vars = lappend(result->translated_vars, var);
-	}
-	result->parent_reloid = apinfo->parent_reloid;
-
-	return result;
+	return expression_tree_mutator(node, __fixup_customscan_expressions_walker, __priv);
 }
 
-AppendRelInfo **
-find_appinfos_by_relids_nofail(PlannerInfo *root,
-							   Relids relids,
-							   int *nappinfos)
+Expr *
+fixup_scanstate_expr(ScanState *ss, Expr *expr)
 {
-	AppendRelInfo **appstack;
+	if (IsA(ss, CustomScanState))
+		return (Expr *)__fixup_customscan_expressions_walker((Node *)expr,
+															 ss->ps.plan);
+	return expr;
+}
+
+List *
+fixup_scanstate_quals(ScanState *ss, List *quals)
+{
+	if (IsA(ss, CustomScanState))
+		return (List *)__fixup_customscan_expressions_walker((Node *)quals,
+															 ss->ps.plan);
+	return quals;
+}
+
+/*
+ * fixup_expression_by_partition_leaf
+ */
+List *
+fixup_expression_by_partition_leaf(PlannerInfo *root,
+								   Relids leaf_relids,
+								   List *clauses)
+{
 	AppendRelInfo **appinfos;
-	ListCell   *lc;
-	int			nrooms = bms_num_members(relids);
-	int			nitems = 0;
+	Relids		next_relids = NULL;
+	int			i, nitems = 0;
 
-	appinfos = palloc0(sizeof(AppendRelInfo *) * nrooms);
-	appstack = alloca(sizeof(AppendRelInfo *) * root->simple_rel_array_size);
-	foreach (lc, root->append_rel_list)
+	if (!root->append_rel_array)
+		return clauses;		/* shortcut */
+
+	appinfos = alloca(sizeof(AppendRelInfo *) * root->simple_rel_array_size);
+	for (i = bms_next_member(leaf_relids, -1);
+		 i >= 0;
+		 i = bms_next_member(leaf_relids, i))
 	{
-		AppendRelInfo *apinfo = lfirst(lc);
+		AppendRelInfo *appinfo = root->append_rel_array[i];
 
-		if (bms_is_member(apinfo->child_relid, relids))
+		if (appinfo)
 		{
-			appstack[0] = apinfo;
-			appinfos[nitems++] = build_multilevel_appinfos(root, appstack, 1);
+			Assert(appinfo->child_relid == i);
+			appinfos[nitems++] = appinfo;
+			next_relids = bms_add_member(next_relids, appinfo->parent_relid);
 		}
 	}
-	Assert(nitems <= nrooms);
-	*nappinfos = nitems;
 
-	return appinfos;
+	if (nitems > 0)
+	{
+		clauses = fixup_expression_by_partition_leaf(root,
+													 next_relids,
+													 clauses);
+		clauses = (List *)adjust_appendrel_attrs(root,
+												 (Node *)clauses,
+												 nitems,
+												 appinfos);
+	}
+	return clauses;
 }
 
 /*
- * get_parallel_divisor - Estimate the fraction of the work that each worker
- * will do given the number of workers budgeted for the path.
+ * fixup_relids_by_partition_leaf
  */
-double
-get_parallel_divisor(Path *path)
+Relids
+fixup_relids_by_partition_leaf(PlannerInfo *root,
+							   const Relids leaf_relids,
+							   const Relids parent_relids)
 {
-	double		parallel_divisor = path->parallel_workers;
+	Relids	results = NULL;
+	int		curr;
 
-#if PG_VERSION_NUM >= 110000
-	if (parallel_leader_participation)
-#endif
+	for (curr = bms_next_member(leaf_relids, -1);
+		 curr >= 0;
+		 curr = bms_next_member(leaf_relids, curr))
 	{
-		double	leader_contribution;
+		int		relid = curr;
+	again:
+		for (int k=0; k < root->simple_rel_array_size; k++)
+		{
+			AppendRelInfo *ap_info = root->append_rel_array[k];
 
-		leader_contribution = 1.0 - (0.3 * path->parallel_workers);
-		if (leader_contribution > 0)
-			parallel_divisor += leader_contribution;
+			if (ap_info && ap_info->child_relid == relid)
+			{
+				if (ap_info->parent_relid == relid)
+					break;
+				relid = ap_info->parent_relid;
+				goto again;
+			}
+		}
+		results = bms_add_member(results, relid);
 	}
-	return parallel_divisor;
+	return results;
 }
-#endif
 
 /*
  * append a binary chunk at the aligned block
@@ -867,6 +916,331 @@ pgstrom_copy_pathnode(const Path *pathnode)
 			elog(ERROR, "Bug? unknown path-node: %s", nodeToString(pathnode));
 	}
 	return NULL;
+}
+
+/*
+ * pathNameMatchByPattern
+ *
+ * It excludes the path-names which don't match with the given pattern.
+ * The pattern can use the following special characters as wildcard. 
+ *
+ * '?' : any character
+ * '*' : any characters (more than 0-length)
+ * '\' : escape character
+ * '${KEY}' : this token is considered as a content of the KEY attribute.
+ * '@{KEY}' : this token is considered as a content of the KEY attribute (only numeric)
+ *
+ * Entire logic is similar to textlike(), see MatchText() in like_match.c
+ */
+#define LIKE_TRUE		1
+#define LIKE_FALSE		0
+#define LIKE_ABORT		(-1)
+
+#define NextByte(p,plen)	((p)++, (plen)--)
+#define NextChar(p,plen)	\
+	do { int __l = pg_mblen(p); (p) +=__l; (plen) -=__l; } while(0)
+static inline int
+CHAREQ(const char *p1, const char *p2)
+{
+	int		p1_len;
+
+	/* Optimization:  quickly compare the first byte. */
+	if (*p1 != *p2)
+		return 0;
+
+	p1_len = pg_mblen(p1);
+	if (pg_mblen(p2) != p1_len)
+		return 0;
+
+	/* They are the same length */
+	while (p1_len--)
+	{
+		if (*p1++ != *p2++)
+			return 0;
+	}
+	return 1;
+}
+
+static int
+__fetchWildCard(const char *p, int plen, char *keybuf)
+{
+	if (*p == '*')
+	{
+		return 1;
+	}
+	else if (*p == '$' || *p == '@')
+	{
+		const char *start = p;
+
+		NextByte(p, plen);
+		if (plen <= 0 || *p != '{')
+			elog(ERROR, "Path pattern contains wrong wildcard");
+		NextByte(p, plen);
+		while (plen > 0 && *p != '}')
+		{
+			if (*p == '\\')
+			{
+				NextByte(p, plen);
+				if (plen <= 0)
+					elog(ERROR, "Path pattern must not end with escape character");
+			}
+			for (int cnt = pg_mblen(p); cnt > 0; cnt--)
+			{
+				*keybuf++ = *p;
+				NextByte(p, plen);
+			}
+		}
+		if (plen <= 0)
+			elog(ERROR, "Path pattern contains unclosed key phrase");
+		*keybuf++ = '\0';
+		Assert(*p == '}');
+		NextByte(p, plen);
+		return (p - start);
+	}
+	return 0;
+}
+
+static int
+__matchByPattern(const char *t, int tlen,
+				 const char *p, int plen,
+				 List **p_attrKinds,
+				 List **p_attrKeys,
+				 List **p_attrValues)
+{
+	char   *keybuf = alloca(plen+10);
+	List   *attrKinds = NIL;
+	List   *attrKeys = NIL;
+	List   *attrValues = NIL;
+	int		cnt;
+
+	/* Since this function recurses, it could be driven to stack overflow */
+	check_stack_depth();
+
+	/*
+	 * In this loop, we advance by char when matching wildcards (and thus on
+	 * recursive entry to this function we are properly char-synced). On other
+	 * occasions it is safe to advance by byte, as the text and pattern will
+	 * be in lockstep. This allows us to perform all comparisons between the
+	 * text and pattern on a byte by byte basis, even for multi-byte
+	 * encodings.
+	 */
+	while (tlen > 0 && plen > 0)
+	{
+		if (*p == '\\')
+		{
+			/* Next pattern byte must match literally, whatever it is */
+			NextByte(p, plen);
+			/* ... and there had better be one, per SQL standard */
+			if (plen <= 0)
+				elog(ERROR, "Path pattern must not end with escape character");
+			if (*p != *t)
+			{
+				list_free(attrKinds);
+				list_free_deep(attrKeys);
+				list_free_deep(attrValues);
+				return LIKE_FALSE;
+			}
+		}
+		else if ((cnt = __fetchWildCard(p, plen, keybuf)) > 0)
+		{
+			const char *t_base = t;
+			char	wildcard = *p;
+
+			Assert(wildcard == '*' || wildcard == '$' || wildcard == '@');
+			Assert(cnt <= plen);
+			p += cnt;
+			plen -= cnt;
+
+			/*
+			 * If we're at end of pattern, match: we have a trailing % which
+			 * matches any remaining text string.
+			 * In case of '${KEY}' wildcard, remained characters must be numeric.
+			 */
+			if (plen <= 0)
+			{
+				if (wildcard == '@')
+				{
+					const char *__t = t;
+					int			__tlen = tlen;
+
+					while (tlen > 0)
+					{
+						if (*t < '0' || *t > '9')
+						{
+							list_free(attrKinds);
+							list_free_deep(attrKeys);
+							list_free_deep(attrValues);
+							return LIKE_FALSE;
+						}
+						NextByte(t, tlen);
+					}
+					attrKinds  = lappend_int(attrKinds, wildcard);
+					attrKeys   = lappend(attrKeys,   pstrdup(keybuf));
+					attrValues = lappend(attrValues, pnstrdup(__t, __tlen));
+				}
+				else if (wildcard == '$')
+				{
+					attrKinds  = lappend_int(attrKinds, wildcard);
+					attrKeys   = lappend(attrKeys,   pstrdup(keybuf));
+					attrValues = lappend(attrValues, pnstrdup(t, tlen));
+				}
+				*p_attrKinds  = attrKinds;
+				*p_attrKeys   = attrKeys;
+				*p_attrValues = attrValues;
+				return LIKE_TRUE;
+			}
+
+			/*
+			 * Otherwise, scan for a text position at which we can match the
+			 * rest of the pattern.  The first remaining pattern char is known
+			 * to be a regular or escaped literal character, so we can compare
+			 * the first pattern byte to each text byte to avoid recursing
+			 * more than we have to.  This fact also guarantees that we don't
+			 * have to consider a match to the zero-length substring at the
+			 * end of the text.
+			 */
+			while (tlen > 0)
+			{
+				List   *__attrKinds = NIL;
+				List   *__attrKeys = NIL;
+				List   *__attrValues = NIL;
+				int		status = __matchByPattern(t, tlen,
+												  p, plen,
+												  &__attrKinds,
+												  &__attrKeys,
+												  &__attrValues);
+				if (status == LIKE_TRUE)
+				{
+					attrKinds  = lappend_int(attrKinds, wildcard);
+					attrKeys   = lappend(attrKeys,   pstrdup(keybuf));
+					attrValues = lappend(attrValues, pnstrdup(t_base, t - t_base));
+					*p_attrKinds  = list_concat(attrKinds,  __attrKinds);
+					*p_attrKeys   = list_concat(attrKeys,   __attrKeys);
+					*p_attrValues = list_concat(attrValues, __attrValues);
+					list_free(__attrKinds);
+					list_free(__attrKeys);
+					list_free(__attrValues);
+					return LIKE_TRUE;
+				}
+				else
+				{
+					list_free(__attrKinds);
+					list_free_deep(__attrKeys);
+					list_free_deep(__attrValues);
+					if (status == LIKE_ABORT)
+						return status;
+					if (wildcard == '@' && !isdigit(*t))
+						return LIKE_FALSE;
+				}
+				NextChar(t, tlen);
+			}
+			/*
+			 * End of text with no match, so no point in trying later places
+			 * to start matching this pattern.
+			 */
+			list_free(attrKinds);
+			list_free_deep(attrKeys);
+			list_free_deep(attrValues);
+			return LIKE_ABORT;
+		}
+		else if (*p == '?')
+		{
+			/* '?' matches any single character, and we know there is one */
+			NextChar(t, tlen);
+			NextByte(p, plen);
+			continue;
+		}
+		else if (*p != *t)
+		{
+			/* non-wildcard pattern char fails to match text char */
+			list_free(attrKinds);
+			list_free_deep(attrKeys);
+			list_free_deep(attrValues);
+			return LIKE_FALSE;
+		}
+
+		/*
+		 * Pattern and text match, so advance.
+		 *
+		 * It is safe to use NextByte instead of NextChar here, even for
+		 * multi-byte character sets, because we are not following immediately
+		 * after a wildcard character. If we are in the middle of a multibyte
+		 * character, we must already have matched at least one byte of the
+		 * character from both text and pattern; so we cannot get out-of-sync
+		 * on character boundaries.  And we know that no backend-legal
+		 * encoding allows ASCII characters such as '%' to appear as non-first
+		 * bytes of characters, so we won't mistakenly detect a new wildcard.
+		 */
+		NextByte(t, tlen);
+		NextByte(p, plen);
+	}
+	if (tlen > 0)
+	{
+		list_free(attrKinds);
+		list_free_deep(attrKeys);
+		list_free_deep(attrValues);
+		return LIKE_FALSE;		/* end of pattern, but not of text */
+	}
+
+	/*
+	 * End of text, but perhaps not of pattern.  Match iff the remaining
+	 * pattern can match a zero-length string, ie, it's zero or more %'s.
+	 */
+	while (plen > 0 && *p == '*')
+		NextByte(p, plen);
+	if (plen <= 0)
+	{
+		*p_attrKinds  = attrKinds;
+		*p_attrKeys   = attrKeys;
+		*p_attrValues = attrValues;
+		return LIKE_TRUE;
+	}
+	/*
+	 * End of text with no match, so no point in trying later places to start
+	 * matching this pattern.
+	 */
+	list_free(attrKinds);
+	list_free_deep(attrKeys);
+	list_free_deep(attrValues);
+	return LIKE_ABORT;
+}
+
+bool
+pathNameMatchByPattern(const char *pathname,
+					   const char *pattern,
+					   List **p_attrKinds,
+					   List **p_attrKeys,
+					   List **p_attrValues)
+{
+	char	   *namebuf = alloca(strlen(pathname) + 10);
+	char	   *filename;
+	List	   *attrKinds = NIL;
+	List	   *attrKeys = NIL;
+	List	   *attrValues = NIL;
+
+	strcpy(namebuf, pathname);
+	filename = basename(namebuf);
+	if (__matchByPattern(filename, strlen(filename),
+						 pattern,  strlen(pattern),
+						 &attrKinds,
+						 &attrKeys,
+						 &attrValues) == LIKE_TRUE)
+	{
+		if (p_attrKinds)
+			*p_attrKinds = attrKinds;
+		else
+			list_free(attrKinds);
+		if (p_attrKeys)
+			*p_attrKeys = attrKeys;
+		else
+			list_free_deep(attrKeys);
+		if (p_attrValues)
+			*p_attrValues = attrValues;
+		else
+			list_free_deep(attrValues);
+		return true;
+	}
+	return false;
 }
 
 /*

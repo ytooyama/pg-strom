@@ -61,8 +61,6 @@
                   </li>
                   <li class="toctree-l1"><a class="reference internal" href="../postgis/">PostGIS</a>
                   </li>
-                  <li class="toctree-l1"><a class="reference internal" href="../hll_count/">HyperLogLog</a>
-                  </li>
                   <li class="toctree-l1"><a class="reference internal" href="../troubles/">Trouble Shooting</a>
                   </li>
               </ul>
@@ -85,7 +83,7 @@
                   </li>
                   <li class="toctree-l1"><a class="reference internal" href="../ref_sqlfuncs/">SQL Objects</a>
                   </li>
-                  <li class="toctree-l1 current"><a class="reference internal current" href="./">GUC Parameters</a>
+                  <li class="toctree-l1 current"><a class="reference internal current" href="#">GUC Parameters</a>
     <ul class="current">
     <li class="toctree-l2"><a class="reference internal" href="#enablesdisables-a-particular-feature">Enables/disables a particular feature</a>
     </li>
@@ -106,6 +104,10 @@
               </ul>
               <p class="caption"><span class="caption-text">Release Note</span></p>
               <ul>
+                  <li class="toctree-l1"><a class="reference internal" href="../release_v5.2/">PG-Strom v5.2</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../release_v5.1/">PG-Strom v5.1</a>
+                  </li>
                   <li class="toctree-l1"><a class="reference internal" href="../release_v5.0/">PG-Strom v5.0</a>
                   </li>
                   <li class="toctree-l1"><a class="reference internal" href="../release_v3.0/">PG-Strom v3.0</a>
@@ -159,7 +161,7 @@
 <dd>Enables/disables GpuPreAgg</dd>
 <dt><code>pg_strom.enable_numeric_aggfuncs</code> [type: <code>bool</code> / default: <code>on]</code></dt>
 <dd>Enables/disables support of aggregate function that takes <code>numeric</code> data type.</dd>
-<dd>Note that aggregated function at GPU mapps <code>numeric</code> data type to double precision floating point values. So, if you are sensitive to calculation errors, you can turn off this configuration to suppress the calculation errors by the operations on CPU.</dd>
+<dd>Note that aggregated function at GPU mapps <code>numeric</code> data type to 128bit fixed-point variable, so it raises an error if you run the aggregate functions with extremely large or highly-precise values. You can turn off this configuration to enforce the aggregate functions being operated by CPU.</dd>
 <dt><code>pg_strom.enable_brin</code> [type: <code>bool</code> / default: <code>on]</code></dt>
 <dd>Enables/disables BRIN index support on tables scan</dd>
 <dt><code>pg_strom.cpu_fallback</code> [type: <code>enum</code> / default: <code>notice</code>]</dt>
@@ -178,20 +180,14 @@
 <dd>Cost value to send tuples to, or receive tuples from GPU for each.</dd>
 <dt><code>pg_strom.gpu_operator_cost</code> [type: <code>real</code> / default: <code>DEFAULT_CPU_OPERATOR_COST / 16</code>]</dt>
 <dd>Cost value to process an expression formula on GPU. If larger value than <code>cpu_operator_cost</code> is configured, no chance to choose PG-Strom towards any size of tables</dd>
+<dt><code>pg_strom.enable_partitionwise_gpujoin</code> [type: <code>bool</code> / default: <code>on]</code></dt>
+<dd>Enables/disables whether GpuJoin is pushed down to the partition children.</dd>
+<dt><code>pg_strom.enable_partitionwise_gpupreagg</code> [type: <code>bool</code> / default: <code>on]</code></dt>
+<dd>Enables/disables whether GpuPreAgg is pushed down to the partition children.</dd>
+<dt><code>pg_strom.pinned_inner_buffer_threshold</code> [type: <code>int</code> / 初期値: <code>0</code>]</dt>
+<dd>If the INNER table of GpuJoin is either GpuScan or GpuJoin, and the estimated size of its processing result is larger than this configured value, the result is retained on the GPU device without being returned to the CPU, and then reused as a part of the INNER buffer of the subsequent GpuJoin.</dd>
+<dd>If the configured value is <code>0</code>, this function will be disabled.</dd>
 </dl>
-<!--
-
-
-`pg_strom.enable_partitionwise_gpujoin` [type: `bool` / default: `on]`
-:   Enables/disables whether GpuJoin is pushed down to the partition children.
-
-
-
-`pg_strom.enable_partitionwise_gpupreagg` [type: `bool` / default: `on]`
-:   Enables/disables whether GpuPreAgg is pushed down to the partition children.
-
--->
-
 <h2 id="executor-configuration">Executor Configuration</h2>
 <dl>
 <dt><code>pg_strom.max_async_tasks</code> [type: <code>int</code> / default: <code>12</code>]</dt>
@@ -308,7 +304,7 @@
           </div><footer>
     <div class="rst-footer-buttons" role="navigation" aria-label="Footer Navigation">
         <a href="../ref_sqlfuncs/" class="btn btn-neutral float-left" title="SQL Objects"><span class="icon icon-circle-arrow-left"></span> Previous</a>
-        <a href="../release_v5.0/" class="btn btn-neutral float-right" title="PG-Strom v5.0">Next <span class="icon icon-circle-arrow-right"></span></a>
+        <a href="../release_v5.2/" class="btn btn-neutral float-right" title="PG-Strom v5.2">Next <span class="icon icon-circle-arrow-right"></span></a>
     </div>
 
   <hr/>
@@ -334,7 +330,7 @@
       <span><a href="../ref_sqlfuncs/" style="color: #fcfcfc">&laquo; Previous</a></span>
     
     
-      <span><a href="../release_v5.0/" style="color: #fcfcfc">Next &raquo;</a></span>
+      <span><a href="../release_v5.2/" style="color: #fcfcfc">Next &raquo;</a></span>
     
   </span>
 </div>

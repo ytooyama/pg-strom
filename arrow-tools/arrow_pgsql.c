@@ -146,6 +146,15 @@ static inline uint16_t __fetch_16bit(const void *addr)
 #endif
 }
 
+static inline int16_t __fetch_16bit_signed(const void *addr)
+{
+#ifdef __PGSTROM_MODULE__
+	return *((int16_t *)addr);
+#else
+	return (int16_t)be16toh(*((uint16_t *)addr));
+#endif
+}
+
 static inline uint32_t __fetch_32bit(const void *addr)
 {
 #ifdef __PGSTROM_MODULE__
@@ -201,11 +210,33 @@ put_bool_value(SQLfield *column, const char *addr, int sz)
 		value = *((const int8_t *)addr);
 		sql_buffer_setbit(&column->nullmap, row_index);
 		if (value)
-			sql_buffer_setbit(&column->values,  row_index);
+			sql_buffer_setbit(&column->values, row_index);
 		else
-			sql_buffer_clrbit(&column->values,  row_index);
+			sql_buffer_clrbit(&column->values, row_index);
 	}
 	return __buffer_usage_inline_type(column);
+}
+
+static size_t
+move_bool_value(SQLfield *dest, const SQLfield *src, long sindex)
+{
+	size_t	dindex = dest->nitems++;
+
+	if (!sql_buffer_getbit(&src->nullmap, sindex))
+	{
+		dest->nullcount++;
+        sql_buffer_clrbit(&dest->nullmap, dindex);
+        sql_buffer_clrbit(&dest->values,  dindex);
+	}
+	else
+	{
+		sql_buffer_setbit(&dest->nullmap, dindex);
+		if (sql_buffer_getbit(&src->values, sindex))
+			sql_buffer_setbit(&dest->values,  dindex);
+		else
+			sql_buffer_clrbit(&dest->values,  dindex);
+	}
+	return __buffer_usage_inline_type(dest);
 }
 
 /*
@@ -321,7 +352,6 @@ put_int32_value(SQLfield *column, const char *addr, int sz)
 		value = __fetch_32bit(addr);
 		sql_buffer_setbit(&column->nullmap, row_index);
 		sql_buffer_append(&column->values, &value, sz);
-
 		STAT_UPDATES(column,i32,value);
 	}
 	return __buffer_usage_inline_type(column);
@@ -425,7 +455,6 @@ write_float16_stat(SQLfield *attr, char *buf, size_t len,
 	return snprintf(buf, len, "%u", (uint32_t)ival);
 }
 
-
 static size_t
 put_float32_value(SQLfield *column, const char *addr, int sz)
 {
@@ -477,9 +506,11 @@ put_float64_value(SQLfield *column, const char *addr, int sz)
 /* parameters of Numeric type */
 #define NUMERIC_DSCALE_MASK	0x3FFF
 #define NUMERIC_SIGN_MASK	0xC000
-#define NUMERIC_POS         0x0000
+#define NUMERIC_POS			0x0000
 #define NUMERIC_NEG         0x4000
-#define NUMERIC_NAN         0xC000
+#define NUMERIC_NAN			0xC000
+#define NUMERIC_PINF		0xD000
+#define NUMERIC_NINF		0xF000
 
 #define NBASE				10000
 #define HALF_NBASE			5000
@@ -572,14 +603,13 @@ put_decimal_value(SQLfield *column, const char *addr, int sz)
 			NumericDigit digits[FLEXIBLE_ARRAY_MEMBER];
 		}  *rawdata = (void *)addr;
 		nv.ndigits	= __fetch_16bit(&rawdata->ndigits);
-		nv.weight	= __fetch_16bit(&rawdata->weight);
+		nv.weight	= __fetch_16bit_signed(&rawdata->weight);
 		nv.sign		= __fetch_16bit(&rawdata->sign);
 		nv.dscale	= __fetch_16bit(&rawdata->dscale);
 		nv.digits	= rawdata->digits;
 #endif	/* __PGSTROM_MODULE__ */
-		if ((nv.sign & NUMERIC_SIGN_MASK) == NUMERIC_NAN)
-			Elog("Decimal128 cannot map NaN in PostgreSQL Numeric");
-
+		if ((nv.sign & NUMERIC_SIGN_MASK) == NUMERIC_SIGN_MASK)
+			Elog("Decimal128 cannot map NaN, +Inf or -Inf in PostgreSQL Numeric");
 		/* makes integer portion first */
 		for (d=0; d <= nv.weight; d++)
 		{
@@ -619,6 +649,58 @@ put_decimal_value(SQLfield *column, const char *addr, int sz)
 	}
 	return __buffer_usage_inline_type(column);
 }
+
+#define MOVE_SCALAR_TEMPLATE(NAME,VALUE_TYPE,STAT_NAME)					\
+	static size_t														\
+	move_##NAME##_value(SQLfield *dest, const SQLfield *src, long sindex) \
+	{																	\
+		size_t	dindex = dest->nitems++;								\
+																		\
+		if (!sql_buffer_getbit(&src->nullmap, sindex))					\
+			__put_inline_null_value(dest, dindex, sizeof(VALUE_TYPE));	\
+		else															\
+		{																\
+			VALUE_TYPE	value;											\
+																		\
+			value = ((VALUE_TYPE *)src->values.data)[sindex];			\
+			sql_buffer_setbit(&dest->nullmap, dindex);					\
+			sql_buffer_append(&dest->values, &value,					\
+							  sizeof(VALUE_TYPE));						\
+			STAT_UPDATES(dest,STAT_NAME,value);							\
+		}																\
+		return __buffer_usage_inline_type(dest);						\
+	}
+MOVE_SCALAR_TEMPLATE(int8,     int8_t,  i8)
+MOVE_SCALAR_TEMPLATE(uint8,   uint8_t,  u8)
+MOVE_SCALAR_TEMPLATE(int16,   int32_t, i32)
+MOVE_SCALAR_TEMPLATE(uint16, uint32_t, u32)
+MOVE_SCALAR_TEMPLATE(int32,   int32_t, i32)
+MOVE_SCALAR_TEMPLATE(uint32, uint32_t, u32)
+MOVE_SCALAR_TEMPLATE(int64,   int64_t, i64)
+MOVE_SCALAR_TEMPLATE(uint64, uint64_t, u64)
+static size_t
+move_float16_value(SQLfield *dest, const SQLfield *src, long sindex)
+{
+	size_t	dindex = dest->nitems++;
+
+	if (!sql_buffer_getbit(&src->nullmap, sindex))
+		__put_inline_null_value(dest, dindex, sizeof(float2_t));
+	else
+	{
+		float2_t	value;
+		float4_t	fval;
+
+		value = ((float2_t *)src->values.data)[sindex];
+		sql_buffer_setbit(&dest->nullmap, dindex);
+		sql_buffer_append(&dest->values, &value, sizeof(float2_t));
+		fval = fp16_to_fp32(value);
+		STAT_UPDATES(dest, f32, fval);
+	}
+	return __buffer_usage_inline_type(dest);
+}
+MOVE_SCALAR_TEMPLATE(float32, float4_t, f32)
+MOVE_SCALAR_TEMPLATE(float64, float8_t, f64)
+MOVE_SCALAR_TEMPLATE(decimal, int128_t, i128)
 
 /*
  * Date
@@ -686,6 +768,24 @@ put_date_value(SQLfield *column, const char *addr, int sz)
 			break;
 	}
 	return column->put_value(column, addr, sz);
+}
+
+
+static size_t
+move_date_value(SQLfield *dest, const SQLfield *src, long sindex)
+{
+	assert(src->arrow_type.Date.unit == dest->arrow_type.Date.unit);
+	switch (src->arrow_type.Date.unit)
+	{
+		case ArrowDateUnit__Day:
+			return move_int32_value(dest, src, sindex);
+		case ArrowDateUnit__MilliSecond:
+			return move_int64_value(dest, src, sindex);
+		default:
+			break;
+	}
+	Elog("ArrowTypeDate has unknown unit (%d)",
+		 src->arrow_type.Date.unit);
 }
 
 /*
@@ -811,6 +911,25 @@ put_time_value(SQLfield *column, const char *addr, int sz)
 			break;
 	}
 	return column->put_value(column, addr, sz);
+}
+
+static size_t
+move_time_value(SQLfield *dest, const SQLfield *src, long sindex)
+{
+	assert(src->arrow_type.Time.unit == dest->arrow_type.Time.unit);
+	switch (src->arrow_type.Time.unit)
+	{
+		case ArrowTimeUnit__Second:
+		case ArrowTimeUnit__MilliSecond:
+			return move_int32_value(dest, src, sindex);
+		case ArrowTimeUnit__MicroSecond:
+		case ArrowTimeUnit__NanoSecond:
+			return move_int64_value(dest, src, sindex);
+		default:
+			break;
+	}
+	Elog("ArrowTypeTime has unknown unit (%d)",
+		 src->arrow_type.Time.unit);
 }
 
 /*
@@ -939,6 +1058,24 @@ put_timestamp_value(SQLfield *column, const char *addr, int sz)
 	return column->put_value(column, addr, sz);
 }
 
+static size_t
+move_timestamp_value(SQLfield *dest, const SQLfield *src, long sindex)
+{
+	assert(src->arrow_type.Timestamp.unit == dest->arrow_type.Timestamp.unit);
+	switch (src->arrow_type.Timestamp.unit)
+	{
+		case ArrowTimeUnit__Second:
+		case ArrowTimeUnit__MilliSecond:
+		case ArrowTimeUnit__MicroSecond:
+		case ArrowTimeUnit__NanoSecond:
+			return move_int64_value(dest, src, sindex);
+		default:
+			break;
+	}
+	Elog("ArrowTypeTimestamp has unknown unit (%d)",
+		 dest->arrow_type.Timestamp.unit);
+}
+
 /*
  * Interval
  */
@@ -1005,12 +1142,29 @@ put_interval_value(SQLfield *sql_field, const char *addr, int sz)
 			sql_field->put_value = __put_interval_day_time_value;
 			break;
 		default:
-			Elog("columnibute \"%s\" has unknown Arrow::Interval.unit(%d)",
+			Elog("column attribute \"%s\" has unknown Arrow::Interval.unit(%d)",
 				 sql_field->field_name,
 				 sql_field->arrow_type.Interval.unit);
 			break;
 	}
 	return sql_field->put_value(sql_field, addr, sz);
+}
+
+static size_t
+move_interval_value(SQLfield *dest, const SQLfield *src, long sindex)
+{
+	assert(src->arrow_type.Interval.unit == dest->arrow_type.Interval.unit);
+	switch (src->arrow_type.Interval.unit)
+	{
+		case ArrowIntervalUnit__Year_Month:
+			return move_uint32_value(dest, src, sindex);
+		case ArrowIntervalUnit__Day_Time:
+			return move_uint64_value(dest, src, sindex);
+		default:
+			break;
+	}
+	Elog("Arrow::Interval.unit is unknown (%d)",
+		 src->arrow_type.Interval.unit);
 }
 
 /*
@@ -1041,6 +1195,27 @@ put_variable_value(SQLfield *column,
 	return __buffer_usage_varlena_type(column);
 }
 
+
+static size_t
+move_variable_value(SQLfield *dest, const SQLfield *src, long sindex)
+{
+	const char *addr = NULL;
+	int			sz = 0;
+
+	if (sql_buffer_getbit(&src->nullmap, sindex))
+	{
+		uint32_t	head = ((uint32_t *)src->values.data)[sindex];
+		uint32_t	tail = ((uint32_t *)src->values.data)[sindex+1];
+
+		assert(head <= tail && tail <= src->extra.usage);
+		if (tail - head >= INT_MAX)
+			Elog("too large variable data (len: %u)", tail - head);
+		addr = src->extra.data + head;
+		sz   = tail - head;
+	}
+	return put_variable_value(dest, addr, sz);
+}
+
 /*
  * FixedSizeBinary
  */
@@ -1067,6 +1242,19 @@ put_bpchar_value(SQLfield *column,
 		sql_buffer_append(&column->values, temp, len);
 	}
 	return __buffer_usage_inline_type(column);
+}
+
+static size_t
+move_bpchar_value(SQLfield *dest, const SQLfield *src, long sindex)
+{
+	const char *addr = NULL;
+	int		unitsz = src->arrow_type.FixedSizeBinary.byteWidth;
+
+	if (sql_buffer_getbit(&src->nullmap, sindex))
+	{
+		addr = src->values.data + unitsz * sindex;
+	}
+	return put_bpchar_value(dest, addr, unitsz);
 }
 
 /*
@@ -1180,6 +1368,37 @@ put_array_value(SQLfield *column,
 		sql_buffer_append(&column->values, &element->nitems, sizeof(int32_t));
 	}
 	return __buffer_usage_inline_type(column) + element->__curr_usage__;
+}
+
+static size_t
+move_array_value(SQLfield *dest, const SQLfield *src, long sindex)
+{
+	SQLfield   *d_elem = dest->element;
+	long		dindex = dest->nitems++;
+
+	if (!sql_buffer_getbit(&src->nullmap, sindex))
+	{
+		/* add NULL */
+		dest->nullcount++;
+		sql_buffer_clrbit(&dest->nullmap, sindex);
+		sql_buffer_append(&dest->values, &d_elem->nitems, sizeof(int32_t));
+	}
+	else
+	{
+		SQLfield   *s_elem = src->element;
+		uint32_t	head = ((uint32_t *)src->values.data)[sindex];
+		uint32_t	tail = ((uint32_t *)src->values.data)[sindex+1];
+		uint32_t	curr;
+
+		assert(head <= tail);
+		assert(IsSQLfieldCompatible(d_elem, s_elem));
+		for (curr = head; curr < tail; curr++)
+			sql_field_move_value(d_elem, s_elem, curr);
+
+		sql_buffer_setbit(&dest->nullmap, dindex);
+		sql_buffer_append(&dest->values, &d_elem->nitems, sizeof(int32_t));
+	}
+	return __buffer_usage_inline_type(dest) + d_elem->__curr_usage__;
 }
 
 /*
@@ -1302,6 +1521,38 @@ put_composite_value(SQLfield *column,
 }
 
 static size_t
+move_composite_value(SQLfield *dest, const SQLfield *src, long sindex)
+{
+	long	dindex = dest->nitems++;
+	size_t	usage = 0;
+
+	if (!sql_buffer_getbit(&src->nullmap, sindex))
+	{
+		dest->nullcount++;
+		sql_buffer_clrbit(&dest->nullmap, dindex);
+		for (int j=0; j < dest->nfields; j++)
+		{
+			usage += sql_field_put_value(&dest->subfields[j], NULL, 0);
+		}
+	}
+	else
+	{
+		for (int j=0; j < dest->nfields; j++)
+		{
+			usage += sql_field_move_value(&dest->subfields[j],
+										  &src->subfields[j], sindex);
+		}
+		sql_buffer_setbit(&dest->nullmap, dindex);
+	}
+	if (dest->nullcount > 0)
+		usage += ARROWALIGN(dest->nullmap.usage);
+	return usage;
+}
+
+/*
+ * Enum values
+ */
+static size_t
 put_dictionary_value(SQLfield *column,
 					 const char *addr, int sz)
 {
@@ -1317,7 +1568,7 @@ put_dictionary_value(SQLfield *column,
 	{
 		SQLdictionary *enumdict = column->enumdict;
 		hashItem   *hitem;
-		uint32_t		hash;
+		uint32_t	hash;
 
 		hash = hash_any((const unsigned char *)addr, sz);
 		for (hitem = enumdict->hslots[hash % enumdict->nslots];
@@ -1335,6 +1586,20 @@ put_dictionary_value(SQLfield *column,
 		sql_buffer_append(&column->values,  &hitem->index, sizeof(int32_t));
 	}
 	return __buffer_usage_inline_type(column);
+}
+
+static size_t
+move_dictionary_value(SQLfield *dest, const SQLfield *src, long sindex)
+{
+	if (!sql_buffer_getbit(&src->nullmap, sindex))
+		return put_dictionary_value(dest, NULL, 0);
+	if (dest->enumdict == src->enumdict)
+	{
+		uint32_t	enum_id = ((uint32_t *)src->values.data)[sindex];
+
+		return put_uint32_value(dest, (char *)&enum_id, sizeof(uint32_t));
+	}
+	Elog("Different Enum dictionary is not compatible");
 }
 
 /*
@@ -1396,21 +1661,25 @@ assignArrowTypeInt(SQLfield *column, bool is_signed,
 		case sizeof(char):
 			column->arrow_type.Int.bitWidth = 8;
 			column->put_value = (is_signed ? put_int8_value : put_uint8_value);
+			column->move_value = (is_signed ? move_int8_value : move_uint8_value);
 			column->write_stat = write_int8_stat;
 			break;
 		case sizeof(short):
 			column->arrow_type.Int.bitWidth = 16;
 			column->put_value = (is_signed ? put_int16_value : put_uint16_value);
+			column->move_value = (is_signed ? move_int16_value : move_uint16_value);
 			column->write_stat = write_int16_stat;
 			break;
 		case sizeof(int):
 			column->arrow_type.Int.bitWidth = 32;
 			column->put_value = (is_signed ? put_int32_value : put_uint32_value);
+			column->move_value = (is_signed ? move_int32_value : move_uint32_value);
 			column->write_stat = write_int32_stat;
 			break;
 		case sizeof(long):
 			column->arrow_type.Int.bitWidth = 64;
 			column->put_value = (is_signed ? put_int64_value : put_uint64_value);
+			column->move_value = (is_signed ? move_int64_value : move_uint64_value);
 			column->write_stat = write_int64_stat;
 			break;
 		default:
@@ -1441,18 +1710,21 @@ assignArrowTypeFloatingPoint(SQLfield *column, ArrowField *arrow_field)
 			column->arrow_type.FloatingPoint.precision
 				= ArrowPrecision__Half;
 			column->put_value = put_float16_value;
+			column->move_value = move_float16_value;
 			column->write_stat = write_float16_stat;
 			break;
 		case sizeof(float):
 			column->arrow_type.FloatingPoint.precision
 				= ArrowPrecision__Single;
 			column->put_value = put_float32_value;
+			column->move_value = move_float32_value;
 			column->write_stat = write_int32_stat;
 			break;
 		case sizeof(double):
 			column->arrow_type.FloatingPoint.precision
 				= ArrowPrecision__Double;
 			column->put_value = put_float64_value;
+			column->move_value = move_float64_value;
 			column->write_stat = write_int64_stat;
 			break;
 		default:
@@ -1480,6 +1752,7 @@ assignArrowTypeBinary(SQLfield *column, ArrowField *arrow_field)
 		Elog("attribute '%s' is not compatible", column->field_name);
 	initArrowNode(&column->arrow_type, Binary);
 	column->put_value = put_variable_value;
+	column->move_value = move_variable_value;
 	return 3;		/* nullmap + index + extra */
 }
 
@@ -1491,6 +1764,7 @@ assignArrowTypeUtf8(SQLfield *column, ArrowField *arrow_field)
 		Elog("attribute '%s' is not compatible", column->field_name);
 	initArrowNode(&column->arrow_type, Utf8);
 	column->put_value = put_variable_value;
+	column->move_value = move_variable_value;
 	return 3;		/* nullmap + index + extra */
 }
 
@@ -1511,7 +1785,7 @@ assignArrowTypeBpchar(SQLfield *column, ArrowField *arrow_field)
 	initArrowNode(&column->arrow_type, FixedSizeBinary);
 	column->arrow_type.FixedSizeBinary.byteWidth = byteWidth;
 	column->put_value = put_bpchar_value;
-
+	column->move_value = move_bpchar_value;
 	return 2;		/* nullmap + values */
 }
 
@@ -1524,6 +1798,7 @@ assignArrowTypeBool(SQLfield *column, ArrowField *arrow_field)
 
 	initArrowNode(&column->arrow_type, Bool);
 	column->put_value = put_bool_value;
+	column->move_value = move_bool_value;
 
 	return 2;		/* nullmap + values */
 }
@@ -1553,6 +1828,7 @@ assignArrowTypeDecimal(SQLfield *column, ArrowField *arrow_field)
 	column->arrow_type.Decimal.scale = scale;
 	column->arrow_type.Decimal.bitWidth = 128;
 	column->put_value = put_decimal_value;
+	column->move_value = move_decimal_value;
 	column->write_stat = write_int128_stat;
 
 	return 2;		/* nullmap + values */
@@ -1572,6 +1848,7 @@ assignArrowTypeDate(SQLfield *column, ArrowField *arrow_field)
 	initArrowNode(&column->arrow_type, Date);
 	column->arrow_type.Date.unit = unit;
 	column->put_value = put_date_value;
+	column->move_value = move_date_value;
 	column->write_stat = write_null_stat;
 
 	return 2;		/* nullmap + values */
@@ -1592,6 +1869,7 @@ assignArrowTypeTime(SQLfield *column, ArrowField *arrow_field)
 	column->arrow_type.Time.unit = unit;
 	column->arrow_type.Time.bitWidth = 64;
 	column->put_value = put_time_value;
+	column->move_value = move_time_value;
 	column->write_stat = write_null_stat;
 
 	return 2;		/* nullmap + values */
@@ -1617,6 +1895,7 @@ assignArrowTypeTimestamp(SQLfield *column, const char *tz_name,
 		column->arrow_type.Timestamp._timezone_len = strlen(tz_name);
 	}
 	column->put_value = put_timestamp_value;
+	column->move_value = move_timestamp_value;
 	column->write_stat = write_null_stat;
 
 	return 2;		/* nullmap + values */
@@ -1636,6 +1915,7 @@ assignArrowTypeInterval(SQLfield *column, ArrowField *arrow_field)
 	initArrowNode(&column->arrow_type, Interval);
 	column->arrow_type.Interval.unit = unit;
 	column->put_value = put_interval_value;
+	column->move_value = move_interval_value;
 
 	return 2;		/* nullmap + values */
 }
@@ -1649,6 +1929,7 @@ assignArrowTypeList(SQLfield *column, ArrowField *arrow_field)
 
 	initArrowNode(&column->arrow_type, List);
 	column->put_value = put_array_value;
+	column->move_value = move_array_value;
 
 	return 2;		/* nullmap + offset vector */
 }
@@ -1662,6 +1943,7 @@ assignArrowTypeStruct(SQLfield *column, ArrowField *arrow_field)
 
 	initArrowNode(&column->arrow_type, Struct);
 	column->put_value = put_composite_value;
+	column->move_value = move_composite_value;
 
 	return 1;	/* only nullmap */
 }
@@ -1686,6 +1968,7 @@ assignArrowTypeDictionary(SQLfield *column, ArrowField *arrow_field)
 
 	initArrowNode(&column->arrow_type, Utf8);
 	column->put_value = put_dictionary_value;
+	column->move_value = move_dictionary_value;
 
 	return 2;	/* nullmap + values */
 }
@@ -1699,6 +1982,7 @@ assignArrowTypeExtraCube(SQLfield *column, ArrowField *arrow_field)
 
 	initArrowNode(&column->arrow_type, Binary);
 	column->put_value = put_extra_cube_value;
+	column->move_value = move_variable_value;
 	return 3;		/* nullmap + index + extra */
 }
 
@@ -1708,13 +1992,13 @@ assignArrowTypeExtraCube(SQLfield *column, ArrowField *arrow_field)
 static void
 __assignArrowTypeHint(SQLfield *column,
 					  const char *typname,
-					  const char *typnamespace)
+					  const char *typnamespace,
+					  const char *typextension)
 {
-	int			index = column->numCustomMetadata++;
+	int		index = column->numCustomMetadata++;
 	ArrowKeyValue *kv;
-	const char *pos;
-	char		buf[200];
-	int			sz = 0;
+	char	buf[300];
+	int		sz = 0;
 
 	if (!column->customMetadata)
 		column->customMetadata = palloc(sizeof(ArrowKeyValue) * (index+1));
@@ -1726,22 +2010,20 @@ __assignArrowTypeHint(SQLfield *column,
 	kv->key = pstrdup("pg_type");
 	kv->_key_len = 7;
 
-	/* '.' must be escaped */
-	for (pos = typnamespace; *pos != '\0'; pos++)
+	if (!typextension && strcmp(typnamespace, "pg_catalog") != 0)
 	{
-		if (*pos == '.')
-			buf[sz++] = '\\';
-		buf[sz++] = *pos;
+		strcpy(buf+sz, typnamespace);
+		sz += strlen(typnamespace);
+		buf[sz++] = '.';
 	}
-	buf[sz++] = '.';
-	for (pos = typname; *pos != '\0'; pos++)
+	strcpy(buf+sz, typname);
+	sz += strlen(typname);
+	if (typextension)
 	{
-		if (*pos == '.')
-			buf[sz++] = '\\';
-		buf[sz++] = *pos;
+		buf[sz++] = '@';
+		strcpy(buf+sz, typextension);
+		sz += strlen(typextension);
 	}
-	buf[sz] = '\0';
-
 	kv->value = pstrdup(buf);
 	kv->_value_len = sz;
 }
@@ -1764,7 +2046,6 @@ assignArrowTypePgSQL(SQLfield *column,
 					 Oid typelemid,
 					 const char *tz_name,
 					 const char *extname,
-					 const char *extschema,
 					 ArrowField *arrow_field)
 {
 	SQLtype__pgsql	   *pgtype = &column->sql_type.pgsql;
@@ -1798,14 +2079,14 @@ assignArrowTypePgSQL(SQLfield *column,
 	/* composite type */
 	if (typrelid != 0)
 	{
-		__assignArrowTypeHint(column, typname, typnamespace);
+		__assignArrowTypeHint(column, typname, typnamespace, NULL);
 		return assignArrowTypeStruct(column, arrow_field);
 	}
 
 	/* enum type */
 	if (typtype == 'e')
 	{
-		__assignArrowTypeHint(column, typname, typnamespace);
+		__assignArrowTypeHint(column, typname, typnamespace, NULL);
 		return assignArrowTypeDictionary(column, arrow_field);
 	}
 
@@ -1814,10 +2095,9 @@ assignArrowTypePgSQL(SQLfield *column,
 	{
 		/* contrib/cube (relocatable) */
 		if (strcmp(typname, "cube") == 0 &&
-			strcmp(extname, "cube") == 0 &&
-			strcmp(extschema, typnamespace) == 0)
+			strcmp(extname, "cube") == 0)
 		{
-			__assignArrowTypeHint(column, typname, typnamespace);
+			__assignArrowTypeHint(column, typname, typnamespace, extname);
 			return assignArrowTypeExtraCube(column, arrow_field);
 		}
 	}
@@ -1884,7 +2164,7 @@ assignArrowTypePgSQL(SQLfield *column,
 			typlen == sizeof(int) ||
 			typlen == sizeof(double))
 		{
-			__assignArrowTypeHint(column, typname, typnamespace);
+			__assignArrowTypeHint(column, typname, typnamespace, NULL);
 			return assignArrowTypeInt(column, false, arrow_field);
 		}
 		/*
@@ -1898,7 +2178,7 @@ assignArrowTypePgSQL(SQLfield *column,
 	}
 	else if (typlen == -1)
 	{
-		__assignArrowTypeHint(column, typname, typnamespace);
+		__assignArrowTypeHint(column, typname, typnamespace, NULL);
 		return assignArrowTypeBinary(column, arrow_field);
 	}
 	Elog("PostgreSQL type: '%s' is not supported", typname);

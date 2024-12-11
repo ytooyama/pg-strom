@@ -45,11 +45,10 @@ UPDATE regtest_data
 
 --- force to use GpuScan
 SET enable_seqscan = off;
--- not to print kernel source code
-SET pg_strom.debug_kernel_source = off;
 
 -- ScalarArrayOp test
 SET pg_strom.enabled = on;
+VACUUM ANALYZE regtest_data;
 EXPLAIN (costs off, verbose)
 SELECT id,x INTO test01g FROM regtest_data
  WHERE 72 = ANY(x);
@@ -62,6 +61,7 @@ SELECT id,x INTO test01p FROM regtest_data
 (SELECT * FROM test01p EXCEPT SELECT * FROM test01g);
 
 SET pg_strom.enabled = on;
+VACUUM ANALYZE regtest_data;
 EXPLAIN (costs off, verbose)
 SELECT id,y INTO test02g FROM regtest_data
  WHERE 75.96 = ANY(y);
@@ -74,6 +74,7 @@ SELECT id,y INTO test02p FROM regtest_data
 (SELECT * FROM test02p EXCEPT SELECT * FROM test02g);
 
 SET pg_strom.enabled = on;
+VACUUM ANALYZE regtest_data;
 EXPLAIN (costs off, verbose)
 SELECT id,z INTO test03g FROM regtest_data
   WHERE 'kVOV' = ANY (z);

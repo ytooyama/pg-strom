@@ -28,10 +28,10 @@ INSERT INTO regtest_data (
 
 -- force to use GpuScan and disables to print source files
 SET enable_seqscan = off;
-SET pg_strom.debug_kernel_source = off;
 
 -- test for COALESCE / GREATEST / LEAST
 SET pg_strom.enabled = on;
+VACUUM ANALYZE;
 EXPLAIN (verbose, costs off)
 SELECT id, COALESCE(a, b, c, d) v1,
            GREATEST(a, b, c, d) v2,
@@ -65,6 +65,7 @@ SELECT id, COALESCE(a, b, c, d) v1,
 (SELECT * FROM test01p EXCEPT SELECT * FROM test01g) ORDER BY id;
 
 SET pg_strom.enabled = on;
+VACUUM ANALYZE;
 EXPLAIN (verbose, costs off)
 SELECT id, COALESCE(a::float, b::float, -1.0, d::float / 0.0) v1
   INTO test02g
@@ -85,6 +86,7 @@ SELECT p.id, p.v1, g.v1
 
 -- test for BoolExpr
 SET pg_strom.enabled = on;
+VACUUM ANALYZE;
 EXPLAIN (verbose, costs off)
 SELECT id, not a > b v1,
            (a + b > c + d or a - b < c - d) and memo like '%abc%' v2,
@@ -110,6 +112,7 @@ SELECT id, not a > b v1,
 
 -- test for BooleanTest / NullTest
 SET pg_strom.enabled = on;
+VACUUM ANALYZE;
 EXPLAIN (verbose, costs off)
 SELECT id, a > b IS TRUE v1,
            c > d IS FALSE v2,
@@ -150,6 +153,7 @@ SELECT id, a > b IS TRUE v1,
 
 -- test for CASE ... WHEN
 SET pg_strom.enabled = on;
+VACUUM ANALYZE;
 EXPLAIN (verbose, costs off)
 SELECT id, CASE id % 4
            WHEN 0 THEN 'hoge'
@@ -198,6 +202,7 @@ SELECT id, CASE id % 4
 (SELECT * FROM test30p EXCEPT SELECT * FROM test30g) ORDER BY id;
 
 SET pg_strom.enabled = on;
+VACUUM ANALYZE;
 EXPLAIN (verbose, costs off)
 SELECT id, CASE WHEN memo like '%aa%' THEN 'aaa'
                 WHEN memo like '%bb%' THEN 'bbb'

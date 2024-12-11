@@ -142,7 +142,9 @@ pgstrom_create_dummy_path(PlannerInfo *root, Path *subpath)
 
 	/* sanity checks */
 	if (list_length(upper_target->exprs) != list_length(sub_target->exprs))
-		elog(ERROR, "CustomScan(dummy): incompatible tlist is supplied");
+		elog(ERROR, "CustomScan(dummy): incompatible tlist is supplied\n%s\n%s",
+			 nodeToString(upper_target->exprs),
+			 nodeToString(sub_target->exprs));
 	forboth (lc1, upper_target->exprs,
 			 lc2, sub_target->exprs)
 	{
@@ -328,6 +330,265 @@ pgstrom_removal_dummy_plans(PlannedStmt *pstmt, Plan **p_plan)
 }
 
 /*
+ * pgstrom_path_tracker
+ */
+static HTAB	   *pgstrom_paths_htable = NULL;
+
+typedef struct
+{
+	PlannerInfo *root;
+	Relids		parent_relids;
+	pgstromOuterPathLeafInfo *op_normal_single;
+	pgstromOuterPathLeafInfo *op_normal_parallel;
+	List	   *op_leaf_single;
+	List	   *op_leaf_parallel;
+	Cost		total_cost_single;
+	Cost		total_cost_parallel;
+	bool		identical_inners_single;
+	bool		identical_inners_parallel;
+} pgstromPathEntry;
+
+static uint32
+pgstrom_path_entry_hash(const void *key, Size keysize)
+{
+	const pgstromPathEntry *entry = key;
+
+	return (hash_bytes((const unsigned char *)&entry->root,
+					   sizeof(PlannerInfo *)) ^
+			bms_hash_value(entry->parent_relids));
+}
+
+static int
+pgstrom_path_entry_match(const void *key1, const void *key2, Size keysize)
+{
+	const pgstromPathEntry *entry1 = key1;
+	const pgstromPathEntry *entry2 = key2;
+
+	Assert(keysize == offsetof(pgstromPathEntry,
+							   parent_relids) + sizeof(Relids));
+	return (entry1->root == entry2->root &&
+			bms_equal(entry1->parent_relids,
+					  entry2->parent_relids) ? 0 : -1);
+}
+
+static void
+__pgstrom_build_paths_htable(void)
+{
+	if (!pgstrom_paths_htable)
+	{
+		HASHCTL		hctl;
+
+		memset(&hctl, 0, sizeof(HASHCTL));
+		hctl.hcxt = CurrentMemoryContext;
+		hctl.keysize = offsetof(pgstromPathEntry,
+								parent_relids) + sizeof(Relids);
+		hctl.entrysize = sizeof(pgstromPathEntry);
+		hctl.hash = pgstrom_path_entry_hash;
+		hctl.match = pgstrom_path_entry_match;
+		pgstrom_paths_htable = hash_create("PG-Strom Outer/Leaf Paths Tracker",
+										   256L,
+										   &hctl,
+										   HASH_ELEM |
+										   HASH_FUNCTION |
+										   HASH_COMPARE |
+										   HASH_CONTEXT);
+	}
+}
+
+void
+pgstrom_remember_op_normal(PlannerInfo *root,
+						   RelOptInfo *outer_rel,
+						   pgstromOuterPathLeafInfo *op_leaf,
+						   bool be_parallel)
+{
+	pgstromPathEntry *pp_entry;
+	pgstromPathEntry  pp_key;
+	bool		found;
+
+	/* sanity checks */
+	Assert(list_length(op_leaf->inner_paths_list) == op_leaf->pp_info->num_rels);
+	op_leaf->outer_rel = outer_rel;
+
+	/* lookup the hash-table */
+	__pgstrom_build_paths_htable();
+	memset(&pp_key, 0, sizeof(pgstromPathEntry));
+	pp_key.root = root;
+	pp_key.parent_relids = outer_rel->relids;
+	pp_entry = (pgstromPathEntry *)
+		hash_search(pgstrom_paths_htable,
+					&pp_key,
+					HASH_ENTER,
+					&found);
+	if (!found)
+	{
+		Assert(pp_key.root == pp_entry->root &&
+			   bms_equal(pp_key.parent_relids,
+						 pp_entry->parent_relids));
+		memcpy(pp_entry, &pp_key, sizeof(pgstromPathEntry));
+	}
+
+	if (be_parallel)
+	{
+		if (!pp_entry->op_normal_parallel ||
+			pp_entry->op_normal_parallel->leaf_cost > op_leaf->leaf_cost)
+			pp_entry->op_normal_parallel = op_leaf;
+	}
+	else
+	{
+		if (!pp_entry->op_normal_single ||
+			pp_entry->op_normal_single->leaf_cost > op_leaf->leaf_cost)
+			pp_entry->op_normal_single = op_leaf;
+	}
+}
+
+void
+pgstrom_remember_op_leafs(PlannerInfo *root,
+						  RelOptInfo *parent_rel,
+						  List *op_leaf_list,
+						  bool be_parallel)
+{
+	pgstromPathEntry *pp_entry;
+	pgstromPathEntry  pp_key;
+	ListCell   *cell;
+	List	   *inner_paths_list = NIL;
+	int			identical_inners = -1;
+	Cost		total_cost = 0.0;
+	bool		found;
+
+	__pgstrom_build_paths_htable();
+	/* calculation of total cost */
+	foreach (cell, op_leaf_list)
+	{
+		pgstromOuterPathLeafInfo *op_leaf = lfirst(cell);
+
+		/* sanity checks */
+		Assert(list_length(op_leaf->inner_paths_list) == op_leaf->pp_info->num_rels);
+		op_leaf->outer_rel = parent_rel;
+		total_cost += op_leaf->leaf_cost;
+
+		if (cell == list_head(op_leaf_list))
+		{
+			inner_paths_list = op_leaf->inner_paths_list;
+		}
+		else if (identical_inners != 0)
+		{
+			ListCell   *lc1, *lc2;
+
+			forboth (lc1, inner_paths_list,
+					 lc2, op_leaf->inner_paths_list)
+			{
+				Path   *__i_path1 = lfirst(lc1);
+				Path   *__i_path2 = lfirst(lc2);
+
+				if (!bms_equal(__i_path1->parent->relids,
+							   __i_path2->parent->relids))
+					break;
+			}
+			if (lc1 == NULL && lc2 == NULL)
+				identical_inners = 1;
+			else
+				identical_inners = 0;
+		}
+	}
+	/* lookup the hash-table */
+	memset(&pp_key, 0, sizeof(pgstromPathEntry));
+	pp_key.root = root;
+	pp_key.parent_relids = parent_rel->relids;
+	pp_entry = (pgstromPathEntry *)
+		hash_search(pgstrom_paths_htable,
+					&pp_key,
+					HASH_ENTER,
+					&found);
+	if (!found)
+	{
+		Assert(pp_key.root == pp_entry->root &&
+			   bms_equal(pp_key.parent_relids,
+						 pp_entry->parent_relids));
+		memcpy(pp_entry, &pp_key, sizeof(pgstromPathEntry));
+	}
+
+	if (be_parallel)
+	{
+		if (pp_entry->op_leaf_parallel == NIL ||
+			pp_entry->total_cost_parallel > total_cost)
+		{
+			pp_entry->op_leaf_parallel = op_leaf_list;
+			pp_entry->total_cost_parallel = total_cost;
+			pp_entry->identical_inners_parallel = (identical_inners > 0);
+		}
+	}
+	else
+	{
+		if (pp_entry->op_leaf_single == NIL ||
+			pp_entry->total_cost_single > total_cost)
+		{
+			pp_entry->op_leaf_single = op_leaf_list;
+			pp_entry->total_cost_single = total_cost;
+			pp_entry->identical_inners_single = (identical_inners > 0);
+		}
+	}
+}
+
+pgstromOuterPathLeafInfo *
+pgstrom_find_op_normal(PlannerInfo *root,
+					   RelOptInfo *outer_rel,
+					   bool be_parallel)
+{
+	if (pgstrom_paths_htable)
+	{
+		pgstromPathEntry *pp_entry;
+		pgstromPathEntry  pp_key;
+
+		memset(&pp_key, 0, sizeof(pgstromPathEntry));
+		pp_key.root = root;
+		pp_key.parent_relids = outer_rel->relids;
+		pp_entry = (pgstromPathEntry *)
+			hash_search(pgstrom_paths_htable,
+						&pp_key,
+						HASH_FIND,
+						NULL);
+		if (pp_entry)
+			return (be_parallel
+					? pp_entry->op_normal_parallel
+					: pp_entry->op_normal_single);
+	}
+	return NULL;
+}
+
+List *
+pgstrom_find_op_leafs(PlannerInfo *root,
+					  RelOptInfo *parent_rel,
+					  bool be_parallel,
+					  bool *p_identical_inners)
+{
+	if (pgstrom_paths_htable)
+	{
+		pgstromPathEntry *pp_entry;
+		pgstromPathEntry  pp_key;
+
+		memset(&pp_key, 0, sizeof(pgstromPathEntry));
+		pp_key.root = root;
+		pp_key.parent_relids = parent_rel->relids;
+		pp_entry = (pgstromPathEntry *)
+			hash_search(pgstrom_paths_htable,
+						&pp_key,
+						HASH_FIND,
+						NULL);
+		if (pp_entry)
+		{
+			if (p_identical_inners)
+				*p_identical_inners = (be_parallel
+									   ? pp_entry->identical_inners_parallel
+									   : pp_entry->identical_inners_single);
+			return (be_parallel
+					? pp_entry->op_leaf_parallel
+					: pp_entry->op_leaf_single);
+		}
+	}
+	return NIL;
+}
+
+/*
  * pgstrom_post_planner
  */
 static PlannedStmt *
@@ -336,18 +597,32 @@ pgstrom_post_planner(Query *parse,
 					 int cursorOptions,
 					 ParamListInfo boundParams)
 {
+	HTAB	   *saved_paths_htable = pgstrom_paths_htable;
 	PlannedStmt *pstmt;
 	ListCell   *lc;
 
-	pstmt = planner_hook_next(parse,
-							  query_string,
-							  cursorOptions,
-							  boundParams);
-	/* remove dummy plan */
-	pgstrom_removal_dummy_plans(pstmt, &pstmt->planTree);
-	foreach (lc, pstmt->subplans)
-		pgstrom_removal_dummy_plans(pstmt, (Plan **)&lfirst(lc));
+	PG_TRY();
+	{
+		pgstrom_paths_htable = NULL;
 
+		pstmt = planner_hook_next(parse,
+								  query_string,
+								  cursorOptions,
+								  boundParams);
+		/* remove dummy plan */
+		pgstrom_removal_dummy_plans(pstmt, &pstmt->planTree);
+		foreach (lc, pstmt->subplans)
+			pgstrom_removal_dummy_plans(pstmt, (Plan **)&lfirst(lc));
+	}
+	PG_CATCH();
+	{
+		hash_destroy(pgstrom_paths_htable);
+		pgstrom_paths_htable = saved_paths_htable;
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	hash_destroy(pgstrom_paths_htable);
+	pgstrom_paths_htable = saved_paths_htable;
 	return pstmt;
 }
 
@@ -413,7 +688,6 @@ _PG_init(void)
 		pgstrom_init_dpu_join();
 		pgstrom_init_dpu_preagg();
 	}
-	pgstrom_init_pcie();
 	/* callback for the extension checker */
 	CacheRegisterSyscacheCallback(NAMESPACEOID, pgstrom_extension_checker_callback, 0);
 	/* dummy custom-scan node */

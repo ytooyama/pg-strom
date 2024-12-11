@@ -36,18 +36,22 @@ PG_FUNCTION_INFO_V1(pgstrom_fminmax_final_numeric);
 
 PG_FUNCTION_INFO_V1(pgstrom_partial_sum_int);
 PG_FUNCTION_INFO_V1(pgstrom_partial_sum_fp);
+PG_FUNCTION_INFO_V1(pgstrom_partial_sum_numeric);
 PG_FUNCTION_INFO_V1(pgstrom_partial_sum_cash);
 PG_FUNCTION_INFO_V1(pgstrom_fsum_trans_int);
 PG_FUNCTION_INFO_V1(pgstrom_fsum_trans_fp);
+PG_FUNCTION_INFO_V1(pgstrom_fsum_trans_numeric);
 PG_FUNCTION_INFO_V1(pgstrom_fsum_final_int);
 PG_FUNCTION_INFO_V1(pgstrom_fsum_final_int_as_numeric);
 PG_FUNCTION_INFO_V1(pgstrom_fsum_final_int_as_cash);
 PG_FUNCTION_INFO_V1(pgstrom_fsum_final_fp32);
 PG_FUNCTION_INFO_V1(pgstrom_fsum_final_fp64);
 PG_FUNCTION_INFO_V1(pgstrom_fsum_final_fp64_as_numeric);
+PG_FUNCTION_INFO_V1(pgstrom_fsum_final_numeric);
 PG_FUNCTION_INFO_V1(pgstrom_favg_final_int);
 PG_FUNCTION_INFO_V1(pgstrom_favg_final_fp);
 PG_FUNCTION_INFO_V1(pgstrom_favg_final_num);
+PG_FUNCTION_INFO_V1(pgstrom_favg_final_numeric);
 
 PG_FUNCTION_INFO_V1(pgstrom_partial_variance);
 PG_FUNCTION_INFO_V1(pgstrom_stddev_trans);
@@ -101,7 +105,7 @@ pgstrom_partial_nrows(PG_FUNCTION_ARGS)
 
 	for (i=0; i < PG_NARGS(); i++)
 	{
-		if (PG_ARGISNULL(i) || !PG_GETARG_BOOL(i))
+		if (PG_ARGISNULL(i))
 			PG_RETURN_INT64(0);
 	}
 	PG_RETURN_INT64(1);
@@ -310,6 +314,40 @@ pgstrom_partial_sum_fp(PG_FUNCTION_ARGS)
 }
 
 PUBLIC_FUNCTION(Datum)
+pgstrom_partial_sum_numeric(PG_FUNCTION_ARGS)
+{
+	kagg_state__psum_numeric_packed *r;
+	uint8_t		kind;
+	int16_t		weight;
+	int128_t	value;
+	const char *emsg;
+
+	emsg = __xpu_numeric_from_varlena(&kind,
+									  &weight,
+									  &value,
+									  (varlena *)PG_GETARG_NUMERIC(0));
+	if (emsg)
+		elog(ERROR, "%s: %s", __FUNCTION__, emsg);
+
+	r = palloc0(sizeof(kagg_state__psum_numeric_packed));
+	if (kind == XPU_NUMERIC_KIND__NAN)
+		r->attrs |= __PAGG_NUMERIC_ATTRS__NAN;
+	else if (kind == XPU_NUMERIC_KIND__POS_INF)
+		r->attrs |= __PAGG_NUMERIC_ATTRS__PINF;
+	else if (kind == XPU_NUMERIC_KIND__NEG_INF)
+		r->attrs |= __PAGG_NUMERIC_ATTRS__NINF;
+	else
+	{
+		Assert(kind == XPU_NUMERIC_KIND__VALID);
+		r->attrs |= ((uint32_t)weight & __PAGG_NUMERIC_ATTRS__WEIGHT);
+		__store_int128_packed(&r->sum, value);
+	}
+	r->nitems = 1;
+	SET_VARSIZE(r, sizeof(kagg_state__psum_numeric_packed));
+	PG_RETURN_POINTER(r);
+}
+
+PUBLIC_FUNCTION(Datum)
 pgstrom_partial_sum_cash(PG_FUNCTION_ARGS)
 {
 	kagg_state__psum_int_packed *r = palloc(sizeof(kagg_state__psum_int_packed));
@@ -382,6 +420,94 @@ pgstrom_fsum_trans_fp(PG_FUNCTION_ARGS)
 }
 
 PUBLIC_FUNCTION(Datum)
+pgstrom_fsum_trans_numeric(PG_FUNCTION_ARGS)
+{
+	kagg_state__psum_numeric_packed *state;
+	kagg_state__psum_numeric_packed *arg;
+	MemoryContext		aggcxt;
+	static uint64_t		__pow10[] = {
+		1UL,						/* 10^0 */
+		10UL,						/* 10^1 */
+		100UL,						/* 10^2 */
+		1000UL,						/* 10^3 */
+		10000UL,					/* 10^4 */
+		100000UL,					/* 10^5 */
+		1000000UL,					/* 10^6 */
+		10000000UL,					/* 10^7 */
+		100000000UL,				/* 10^8 */
+		1000000000UL,				/* 10^9 */
+		10000000000UL,				/* 10^10 */
+		100000000000UL,				/* 10^11 */
+		1000000000000UL,			/* 10^12 */
+		10000000000000UL,			/* 10^13 */
+		100000000000000UL,			/* 10^14 */
+		1000000000000000UL,			/* 10^15 */
+		10000000000000000UL,		/* 10^16 */
+		100000000000000000UL,		/* 10^17 */
+		1000000000000000000UL,		/* 10^18 */
+	};
+
+	if (!AggCheckCallContext(fcinfo, &aggcxt))
+		elog(ERROR, "aggregate function called in non-aggregate context");
+	if (PG_ARGISNULL(0))
+	{
+		if (PG_ARGISNULL(1))
+			PG_RETURN_NULL();
+		arg = (kagg_state__psum_numeric_packed *)PG_GETARG_BYTEA_P(1);
+		state = MemoryContextAlloc(aggcxt, sizeof(*state));
+		memcpy(state, arg, sizeof(*state));
+	}
+	else
+	{
+		uint32_t	special;
+
+		state = (kagg_state__psum_numeric_packed *)PG_GETARG_BYTEA_P(0);
+		if (!PG_ARGISNULL(1))
+		{
+			arg = (kagg_state__psum_numeric_packed *)PG_GETARG_BYTEA_P(1);
+			special = (arg->attrs & __PAGG_NUMERIC_ATTRS__MASK);
+			if (special != 0)
+				state->attrs |= special;
+			else
+			{
+				int16_t		weight_s = (int16_t)(state->attrs & __PAGG_NUMERIC_ATTRS__WEIGHT);
+				int16_t		weight_a = (int16_t)(arg->attrs & __PAGG_NUMERIC_ATTRS__WEIGHT);
+				int128_t	ival = __fetch_int128_packed(&arg->sum);
+
+				if (weight_s > weight_a)
+				{
+					int		shift = (weight_s - weight_a);
+
+					while (shift > 0)
+					{
+						int		k = Min(shift, 18);
+
+						ival *= (int128_t)__pow10[k];
+						shift -= k;
+					}
+				}
+				else if (weight_s < weight_a)
+				{
+					int		shift = (weight_a - weight_s);
+
+					while (shift > 0)
+					{
+						int		k = Min(shift, 18);
+
+						ival /= (int128_t)__pow10[k];
+						shift -= k;
+					}
+				}
+				__store_int128_packed(&state->sum, ival +
+									  __fetch_int128_packed(&state->sum));
+			}
+			state->nitems += arg->nitems;
+		}
+	}
+	PG_RETURN_POINTER(state);
+}
+
+PUBLIC_FUNCTION(Datum)
 pgstrom_fsum_final_int(PG_FUNCTION_ARGS)
 {
 	kagg_state__psum_int_packed *state;
@@ -447,6 +573,41 @@ pgstrom_fsum_final_fp64_as_numeric(PG_FUNCTION_ARGS)
 }
 
 PUBLIC_FUNCTION(Datum)
+pgstrom_fsum_final_numeric(PG_FUNCTION_ARGS)
+{
+	kagg_state__psum_numeric_packed *state
+		= (kagg_state__psum_numeric_packed *)PG_GETARG_BYTEA_P(0);
+	uint32_t	special = (state->attrs & __PAGG_NUMERIC_ATTRS__MASK);
+	Datum		datum;
+
+	if (state->nitems == 0)
+		PG_RETURN_NULL();
+	if (special != 0)
+	{
+		const char *str;
+
+		if (special == __PAGG_NUMERIC_ATTRS__PINF)
+			str = "+Inf";
+		else if (special == __PAGG_NUMERIC_ATTRS__NINF)
+			str = "-Inf";
+		else
+			str = "NaN";
+		datum = DirectFunctionCall1(numeric_in, CStringGetDatum(str));
+	}
+	else
+	{
+		int16_t		weight = (state->attrs & __PAGG_NUMERIC_ATTRS__WEIGHT);
+		int128_t	ival = __fetch_int128_packed(&state->sum);
+		int			bufsz = __xpu_numeric_to_varlena(NULL, weight, ival);
+		char	   *buf = palloc(bufsz);
+
+		__xpu_numeric_to_varlena(buf, weight, ival);
+		datum = PointerGetDatum(buf);
+	}
+	PG_RETURN_DATUM(datum);
+}
+
+PUBLIC_FUNCTION(Datum)
 pgstrom_favg_final_int(PG_FUNCTION_ARGS)
 {
 	kagg_state__psum_int_packed *state;
@@ -485,6 +646,44 @@ pgstrom_favg_final_num(PG_FUNCTION_ARGS)
 	sum = DirectFunctionCall1(float8_numeric, Float8GetDatum(state->sum));
 
 	PG_RETURN_DATUM(DirectFunctionCall2(numeric_div, sum, n));
+}
+
+PUBLIC_FUNCTION(Datum)
+pgstrom_favg_final_numeric(PG_FUNCTION_ARGS)
+{
+	kagg_state__psum_numeric_packed *state
+		= (kagg_state__psum_numeric_packed *)PG_GETARG_BYTEA_P(0);
+	uint32_t	special = (state->attrs & __PAGG_NUMERIC_ATTRS__MASK);
+	Datum		datum;
+
+	if (state->nitems == 0)
+		PG_RETURN_NULL();
+	if (special != 0)
+	{
+		const char *str;
+
+		if (special == __PAGG_NUMERIC_ATTRS__PINF)
+			str = "+Inf";
+		else if (special == __PAGG_NUMERIC_ATTRS__NINF)
+			str = "-Inf";
+		else
+			str = "NaN";
+		datum = DirectFunctionCall1(numeric_in, CStringGetDatum(str));
+	}
+	else
+	{
+		int16_t		weight = (state->attrs & __PAGG_NUMERIC_ATTRS__WEIGHT);
+		int128_t	ival = __fetch_int128_packed(&state->sum);
+		int			bufsz = __xpu_numeric_to_varlena(NULL, weight, ival);
+		Numeric		sum = palloc(bufsz);
+		Numeric		div = int64_to_numeric(state->nitems);
+
+		__xpu_numeric_to_varlena((char *)sum, weight, ival);
+		datum = DirectFunctionCall2(numeric_div,
+									NumericGetDatum(sum),
+									NumericGetDatum(div));
+	}
+	PG_RETURN_DATUM(datum);
 }
 
 /*

@@ -3,6 +3,17 @@
 --
 CREATE SCHEMA IF NOT EXISTS pgstrom;
 
+--
+-- MEMO: Some DDL command may internally create a pseudo object
+-- to avoid dependency problems, but does not allow to qualify
+-- the referenced object by namespace.
+-- For example, CREATE OPERATOR '=' can take a negator operator '<>'
+-- before the creation of the '<>', and internally creates the '<>'
+-- operator in the default namespace but it is not an intended
+-- behavior. So, we switch the default namespace to pg_catalog here.
+--
+SET search_path = 'pg_catalog';
+
 -- ================================================================
 --
 -- PG-Strom System Functions, Views and others
@@ -112,10 +123,10 @@ CREATE TYPE pgstrom.__pgstrom_gpucache_info_t AS (
     rowid_num_used      int8,
     rowid_num_free      int8,
     gpu_main_sz         int8,
-	gpu_main_nitems     int8,
+    gpu_main_nitems     int8,
     gpu_extra_sz        int8,
-	gpu_extra_usage     int8,
-	gpu_extra_dead      int8,
+    gpu_extra_usage     int8,
+    gpu_extra_dead      int8,
     redo_write_ts       timestamptz,
     redo_write_nitems   int8,
     redo_write_pos      int8,
@@ -3462,3 +3473,8 @@ CREATE FUNCTION pgstrom.random_daterange(float=0.0,
   RETURNS daterange
   AS 'MODULE_PATHNAME','pgstrom_random_daterange'
   LANGUAGE C CALLED ON NULL INPUT;
+
+--
+-- Reset GUC parameters
+--
+RESET search_path;

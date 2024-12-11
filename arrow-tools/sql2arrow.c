@@ -16,8 +16,10 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <strings.h>
+#include <time.h>
 
 /* command options */
+static char	   *simple_table_name = NULL;
 static char	   *sqldb_command = NULL;
 static char	   *output_filename = NULL;
 static char	   *append_filename = NULL;
@@ -28,10 +30,25 @@ static char	   *sqldb_username = NULL;
 static char	   *sqldb_password = NULL;
 static char	   *sqldb_database = NULL;
 static char	   *dump_arrow_filename = NULL;
+static char	   *schema_arrow_filename = NULL;
+static char	   *schema_arrow_tablename = NULL;
 static char	   *stat_embedded_columns = NULL;
+static int		num_worker_threads = 0;
+static char	   *parallel_dist_keys = NULL;
 static int		shows_progress = 0;
 static userConfigOption *sqldb_session_configs = NULL;
 static nestLoopOption *sqldb_nestloop_options = NULL;
+
+/*
+ * Per-worker state variables
+ */
+static volatile bool	worker_setup_done  = false;
+static pthread_mutex_t	worker_setup_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t	worker_setup_cond  = PTHREAD_COND_INITIALIZER;
+static pthread_t	   *worker_threads;
+static SQLtable		  **worker_tables;
+static const char	  **worker_dist_keys = NULL;
+static pthread_mutex_t	main_table_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 /*
  * __trim
@@ -327,27 +344,6 @@ setup_output_file(SQLtable *table, const char *output_filename)
 	writeArrowSchema(table);
 }
 
-static void
-shows_record_batch_progress(SQLtable *table, size_t nitems)
-{
-	if (shows_progress)
-	{
-		ArrowBlock *block;
-		int			index = table->numRecordBatches - 1;
-
-		assert(index >= 0);
-		block = &table->recordBatches[index];
-		printf("RecordBatch[%d]: "
-			   "offset=%lu length=%lu (meta=%u, body=%lu) nitems=%zu\n",
-			   index,
-			   block->offset,
-			   block->metaDataLength + block->bodyLength,
-			   block->metaDataLength,
-			   block->bodyLength,
-			   nitems);
-	}
-}
-
 static int
 dumpArrowFile(const char *filename)
 {
@@ -376,6 +372,245 @@ dumpArrowFile(const char *filename)
 			   dumpArrowNode((ArrowNode *)&af_info.footer.recordBatches[i]),
 			   dumpArrowNode((ArrowNode *)&af_info.recordBatches[i]));
 	}
+	close(fdesc);
+	return 0;
+}
+
+/*
+ * --schema option support routines
+ */
+static const char *
+__field_name_escaped(const char *field_name)
+{
+	char   *__namebuf;
+	int		i = 0;
+
+	for (const char *c = field_name; *c != '\0'; c++)
+	{
+		if (!isalnum(*c) && *c != '_')
+			goto escaped;
+	}
+	return field_name;
+escaped:
+	__namebuf = malloc(strlen(field_name) * 2 + 100);
+	if (!__namebuf)
+		Elog("out of memory");
+	__namebuf[i++] = '\"';
+	for (const char *c = field_name; *c != '\0'; c++)
+	{
+		if (*c == '\"')
+			__namebuf[i++] = '\\';
+		__namebuf[i++] = *c;
+	}
+	__namebuf[i++] = '\"';
+	__namebuf[i++] = '\0';
+
+	return __namebuf;
+}
+
+static const char *
+__field_type_label(ArrowField *field)
+{
+	const char *pg_type = NULL;
+	const char *label;
+	char	   *namebuf, *pos;
+
+	/* fetch "pg_type" custom-metadata */
+	for (int i=0; i < field->_num_custom_metadata; i++)
+	{
+		ArrowKeyValue *kv = &field->custom_metadata[i];
+
+		if (strcmp(kv->key, "pg_type") == 0)
+		{
+			pg_type = kv->value;
+			if (strcmp(pg_type, "pg_catalog.macaddr") == 0 ||
+				strcmp(pg_type, "macaddr") == 0)
+			{
+				if (field->type.node.tag == ArrowNodeTag__FixedSizeBinary &&
+					field->type.FixedSizeBinary.byteWidth == 6)
+					return "macaddr";
+			}
+			else if (strcmp(pg_type, "pg_catalog.inet") == 0 ||
+					 strcmp(pg_type, "inet") == 0)
+			{
+				if (field->type.node.tag == ArrowNodeTag__FixedSizeBinary &&
+					(field->type.FixedSizeBinary.byteWidth == 4 ||
+					 field->type.FixedSizeBinary.byteWidth == 16))
+					return "inet";
+			}
+			else if (strcmp(pg_type, "cube@cube") == 0)
+			{
+				if (field->type.node.tag == ArrowNodeTag__Binary ||
+					field->type.node.tag == ArrowNodeTag__LargeBinary)
+					return "cube";
+			}
+			break;
+		}
+	}
+
+	switch (field->type.node.tag)
+	{
+		case ArrowNodeTag__Int:
+			switch (field->type.Int.bitWidth)
+			{
+				case 8:	 return "int1";
+				case 16: return "int2";
+				case 32: return "int4";
+				case 64: return "int8";
+				default:
+					Elog("Arrow::Int has unknown bitWidth (%d)",
+						 field->type.Int.bitWidth);
+			}
+			break;
+
+		case ArrowNodeTag__FloatingPoint:
+			switch (field->type.FloatingPoint.precision)
+			{
+				case ArrowPrecision__Half:   return "float2";
+				case ArrowPrecision__Single: return "float4";
+				case ArrowPrecision__Double: return "float8";
+				default:
+					Elog("Arrow::FloatingPoint has unknown precision");
+			}
+			break;
+		case ArrowNodeTag__Utf8:
+		case ArrowNodeTag__LargeUtf8:
+			return "text";
+		case ArrowNodeTag__Binary:
+		case ArrowNodeTag__LargeBinary:
+			return "bytea";
+		case ArrowNodeTag__Bool:
+			return "bool";
+		case ArrowNodeTag__Decimal:
+			return "numeric";
+		case ArrowNodeTag__Date:
+			return "date";
+		case ArrowNodeTag__Time:
+			return "time";
+		case ArrowNodeTag__Timestamp:
+			return "timestamp";
+		case ArrowNodeTag__Interval:
+			return "interval";
+		case ArrowNodeTag__List:
+		case ArrowNodeTag__LargeList:
+			assert(field->_num_children == 1);
+			label = __field_type_label(field->children);
+			namebuf = alloca(strlen(label) + 10);
+			sprintf(namebuf, "%s[]", label);
+			return pstrdup(namebuf);
+		case ArrowNodeTag__Struct:
+			if (pg_type)
+			{
+				namebuf = alloca(strlen(pg_type) + 1);
+
+				strcpy(namebuf, pg_type);
+				/* strip earlier than '.' */
+				pos = strchr(namebuf, '.');
+				if (pos && pos[1] != '\0')
+					namebuf = pos+1;
+			}
+			else
+			{
+				namebuf = alloca(strlen(field->name) + 10);
+
+				sprintf(namebuf, "__%s_comp", field->name);
+			}
+			return pstrdup(namebuf);
+
+		case ArrowNodeTag__FixedSizeBinary:
+		case ArrowNodeTag__FixedSizeList:
+			namebuf = alloca(32);
+			sprintf(namebuf, "char(%d)",
+					field->type.FixedSizeBinary.byteWidth);
+			return pstrdup(namebuf);
+
+		default:
+			Elog("unknown Arrow type at field: %s", field->name);
+			break;
+	}
+	Elog("unknown Arrow type");
+}
+
+static void
+__schemaArrowComposite(ArrowField *field)
+{
+	const char *comp_name;
+
+	if (field->type.node.tag != ArrowNodeTag__Struct)
+		return;
+
+	for (int j=0; j < field->_num_children; j++)
+		__schemaArrowComposite(&field->children[j]);
+
+	comp_name = __field_type_label(field);
+	printf("---\n"
+		   "--- composite type definition of %s\n"
+		   "---\n"
+		   "CREATE TYPE %s AS (\n",
+		   field->name, __field_name_escaped(comp_name));
+	for (int j=0; j < field->_num_children; j++)
+	{
+		if (j > 0)
+			printf(",\n");
+		printf("  %s %s",
+			   __field_name_escaped(field->children[j].name),
+			   __field_type_label(&field->children[j]));
+	}
+	printf("\n);\n\n");
+}
+
+static int
+schemaArrowFile(const char *filename, const char *table_name)
+{
+	ArrowFileInfo af_info;
+	ArrowSchema *schema;
+	int		fdesc;
+
+	memset(&af_info, 0, sizeof(ArrowFileInfo));
+	fdesc = open(filename, O_RDONLY);
+	if (fdesc < 0)
+		Elog("unable to open '%s': %m", filename);
+	readArrowFileDesc(fdesc, &af_info);
+	schema = &af_info.footer.schema;
+	/* TODO: dump enum types if any */
+
+	/* dump composite types if any */
+	for (int j=0; j < schema->_num_fields; j++)
+		__schemaArrowComposite(&schema->fields[j]);
+
+	/* CREATE TABLE command */
+	if (!table_name)
+	{
+		char   *namebuf = alloca(strlen(filename) + 1);
+		char   *pos;
+
+		strcpy(namebuf, filename);
+		namebuf = basename(namebuf);
+		pos = strrchr(namebuf, '.');
+		if (pos && pos != namebuf)
+			*pos = '\0';
+		table_name = namebuf;
+	}
+	printf("---\n"
+		   "--- Definition of %s\n"
+		   "--- (generated from '%s')\n"
+		   "---\n"
+		   "CREATE TABLE %s (\n",
+		   table_name,
+		   filename,
+		   __field_name_escaped(table_name));
+	for (int j=0; j < schema->_num_fields; j++)
+	{
+		if (j > 0)
+			printf(",\n");
+		printf("  %s %s",
+			   __field_name_escaped(schema->fields[j].name),
+			   __field_type_label(&schema->fields[j]));
+		if (!schema->fields[j].nullable)
+			printf(" not null");
+	}
+	printf("\n);\n");
+	close(fdesc);
 	return 0;
 }
 
@@ -481,6 +716,32 @@ parseNestLoopOption(const char *command, bool outer_join)
 }
 #endif	/* __PG2ARROW__ */
 
+int
+parseParallelDistKeys(const char *parallel_dist_keys, const char *delim)
+{
+	char   *temp = pstrdup(parallel_dist_keys);
+	char   *tok, *pos;
+	int		nitems = 0;
+	int		nrooms = 25;
+
+	worker_dist_keys = palloc0(sizeof(const char *) * nrooms);
+	for (tok = strtok_r(temp, delim, &pos);
+		 tok != NULL;
+		 tok = strtok_r(NULL, delim, &pos))
+	{
+		tok = __trim(tok);
+
+		if (nitems >= nrooms)
+		{
+			nrooms += nrooms;
+			worker_dist_keys = repalloc(worker_dist_keys,
+										sizeof(const char *) * nrooms);
+		}
+		worker_dist_keys[nitems++] = tok;
+	}
+	return nitems;
+}
+
 static bool
 __enable_field_stats(SQLfield *field)
 {
@@ -574,6 +835,16 @@ usage(void)
 		  "  -c, --command=COMMAND SQL command to run\n"
 		  "  -t, --table=TABLENAME Equivalent to '-c SELECT * FROM TABLENAME'\n"
 		  "      (-c and -t are exclusive, either of them must be given)\n"
+		  "  -n, --num-workers=N_WORKERS    Enables parallel dump mode.\n"
+		  "                        It requires the SQL command contains $(WORKER_ID)\n"
+		  "                        and $(N_WORKERS), to be replaced by the numeric\n"
+		  "                        worker-id and number of workers.\n"
+		  "  -k, --parallel-keys=PARALLEL_KEYS Enables yet another parallel dump.\n"
+		  "                        It requires the SQL command contains $(PARALLEL_KEY)\n"
+		  "                        to be replaced by the comma separated token in the\n"
+		  "                        PARALLEL_KEYS.\n"
+		  "      (-n and -k are exclusive, either of them can be give if parallel dump.\n"
+		  "       It is user's responsibility to avoid data duplication.)\n"
 #ifdef __PG2ARROW__
 		  "      --inner-join=SUB_COMMAND\n"
 		  "      --outer-join=SUB_COMMAND\n"
@@ -603,6 +874,8 @@ usage(void)
 		  "\n"
 		  "Other options:\n"
 		  "      --dump=FILENAME  dump information of arrow file\n"
+		  "      --schema=FILENAME dump schema definition as CREATE TABLE statement\n"
+		  "      --schema-name=NAME table name in the CREATE TABLE statement\n"
 		  "      --progress       shows progress of the job\n"
 		  "      --set=NAME:VALUE config option to set before SQL execution\n"
 		  "      --help           shows this message\n"
@@ -637,15 +910,16 @@ parse_options(int argc, char * const argv[])
 		{"set",          required_argument, NULL, 1003},
 		{"inner-join",   required_argument, NULL, 1004},
 		{"outer-join",   required_argument, NULL, 1005},
+		{"schema",       required_argument, NULL, 1006},
+		{"schema-name",  required_argument, NULL, 1007},
 		{"stat",         optional_argument, NULL, 'S'},
+		{"num-workers",  required_argument, NULL, 'n'},
+		{"parallel-keys",required_argument, NULL, 'k'},
 		{"help",         no_argument,       NULL, 9999},
 		{NULL, 0, NULL, 0},
 	};
 	int			c;
-	bool		meet_command = false;
-	bool		meet_table = false;
 	int			password_prompt = 0;
-	const char *pos;
 	userConfigOption *last_user_config = NULL;
 	nestLoopOption *last_nest_loop __attribute__((unused)) = NULL;
 
@@ -657,7 +931,7 @@ parse_options(int argc, char * const argv[])
 #ifdef __MYSQL2ARROW__
 							"P:"
 #endif
-							"S::", long_options, NULL)) >= 0)
+							"n:k:S::", long_options, NULL)) >= 0)
 	{
 		switch (c)
 		{
@@ -668,25 +942,22 @@ parse_options(int argc, char * const argv[])
 				break;
 
 			case 'c':
-				if (meet_command)
+				if (sqldb_command)
 					Elog("-c option was supplied twice");
-				if (meet_table)
+				if (simple_table_name)
 					Elog("-c and -t options are exclusive");
 				if (strncmp(optarg, "file://", 7) == 0)
 					sqldb_command = read_sql_command_from_file(optarg + 7);
 				else
-					sqldb_command = optarg;
+					sqldb_command = __trim(optarg);
 				break;
 
 			case 't':
-				if (meet_table)
+				if (simple_table_name)
 					Elog("-t option was supplied twice");
-				if (meet_command)
+				if (sqldb_command)
 					Elog("-c and -t options are exclusive");
-				sqldb_command = malloc(100 + strlen(optarg));
-				if (!sqldb_command)
-					Elog("out of memory");
-				sprintf(sqldb_command, "SELECT * FROM %s", optarg);
+				simple_table_name = __trim(optarg);
 				break;
 
 			case 'o':
@@ -708,22 +979,52 @@ parse_options(int argc, char * const argv[])
 			case 's':
 				if (batch_segment_sz != 0)
 					Elog("-s option was supplied twice");
-				pos = optarg;
-				while (isdigit(*pos))
-					pos++;
-				if (*pos == '\0')
-					batch_segment_sz = atol(optarg);
-				else if (strcasecmp(pos, "k") == 0 ||
-						 strcasecmp(pos, "kb") == 0)
-					batch_segment_sz = atol(optarg) * (1UL << 10);
-				else if (strcasecmp(pos, "m") == 0 ||
-						 strcasecmp(pos, "mb") == 0)
-					batch_segment_sz = atol(optarg) * (1UL << 20);
-				else if (strcasecmp(pos, "g") == 0 ||
-						 strcasecmp(pos, "gb") == 0)
-					batch_segment_sz = atol(optarg) * (1UL << 30);
 				else
-					Elog("segment size is not valid: %s", optarg);
+				{
+					char   *end;
+					long	sz = strtoul(optarg, &end, 10);
+
+					if (sz == 0)
+						Elog("not a valid segment size: %s", optarg);
+					else if (*end == '\0')
+						batch_segment_sz = sz;
+					else if (strcasecmp(end, "k") == 0 ||
+							 strcasecmp(end, "kb") == 0)
+						batch_segment_sz = (sz << 10);
+					else if (strcasecmp(end, "m") == 0 ||
+							 strcasecmp(end, "mb") == 0)
+						batch_segment_sz = (sz << 20);
+					else if (strcasecmp(end, "g") == 0 ||
+							 strcasecmp(end, "gb") == 0)
+						batch_segment_sz = (sz << 30);
+					else
+						Elog("not a valid segment size: %s", optarg);
+				}
+				break;
+
+			case 'n':
+				if (parallel_dist_keys != 0)
+					Elog("-n and -k are exclusive");
+				else if (num_worker_threads != 0)
+					Elog("-n option was supplied twice");
+				else
+				{
+					char   *end;
+					long	num = strtoul(optarg, &end, 10);
+
+					if (*end != '\0' || num < 1 || num > 9999)
+						Elog("not a valid -n|--num-workers option: %s", optarg);
+					num_worker_threads = num;
+				}
+				break;
+
+			case 'k':
+				if (parallel_dist_keys != 0)
+					Elog("-k option was supplied twice");
+				else if (num_worker_threads != 0)
+					Elog("-n and -k are exclusive");
+				else
+					parallel_dist_keys = pstrdup(optarg);
 				break;
 
 			case 'h':
@@ -763,6 +1064,8 @@ parse_options(int argc, char * const argv[])
 				break;
 #endif /* __MYSQL2ARROW__ */
 			case 1001:		/* --dump */
+				if (schema_arrow_filename)
+					Elog("--dump and --schema are exclusive");
 				if (dump_arrow_filename)
 					Elog("--dump option was supplied twice");
 				dump_arrow_filename = optarg;
@@ -811,6 +1114,18 @@ parse_options(int argc, char * const argv[])
 				}
 				break;
 #endif	/* __PG2ARROW__ */
+			case 1006:		/* --schema */
+				if (dump_arrow_filename)
+					Elog("--dump and --schema are exclusive");
+				if (schema_arrow_filename)
+					Elog("--schema was supplied twice");
+				schema_arrow_filename = optarg;
+				break;
+			case 1007:		/* --schema-name */
+				if (schema_arrow_tablename)
+					Elog("--schema-name was supplied twice");
+				schema_arrow_tablename = optarg;
+				break;
 			case 'S':		/* --stat */
 				{
 					if (stat_embedded_columns)
@@ -851,17 +1166,323 @@ parse_options(int argc, char * const argv[])
 		assert(!sqldb_password);
 		sqldb_password = pstrdup(getpass("Password: "));
 	}
-	/* --dump is exclusive other options */
+	/* --dump is exclusive other SQL options */
 	if (dump_arrow_filename)
 	{
 		if (sqldb_command || output_filename || append_filename)
 			Elog("--dump option is exclusive with -c, -t, -o and --append");
 		return;
 	}
-	if (!sqldb_command)
+	/* --schema is exclusive other SQL options */
+	if (schema_arrow_filename)
+	{
+		if (sqldb_command || output_filename || append_filename)
+			Elog("--schema option is exclusive with -c, -t, -o and --append");
+		return;
+	}
+	else if (schema_arrow_tablename)
+	{
+		Elog("--schema-name option must be used with --schema");
+	}
+	/* SQL command options */
+	if (!simple_table_name &&!sqldb_command)
 		Elog("Neither -c nor -t options are supplied");
+	assert((simple_table_name && !sqldb_command) ||
+		   (!simple_table_name && sqldb_command));
+	if (parallel_dist_keys)
+	{
+		if (simple_table_name)
+			Elog("Unable to use -k|--parallel-keys with -t|--table, adopt -c|--command instead");
+		if (strstr(sqldb_command, "$(PARALLEL_KEY)") == NULL)
+			Elog("SQL command must contain $(PARALLEL_KEY) token");
+
+		num_worker_threads = parseParallelDistKeys(parallel_dist_keys, ",");
+	}
+	else if (sqldb_command)
+	{
+		assert(!simple_table_name);
+		if (num_worker_threads == 0 || num_worker_threads == 1)
+		{
+			if (strstr(sqldb_command, "$(WORKER_ID)") != NULL ||
+				strstr(sqldb_command, "$(N_WORKERS)") != NULL ||
+				strstr(sqldb_command, "$(PARALLEL_KEY)") != NULL)
+				Elog("Non-parallel SQL command should not use the reserved keywords: $(WORKER_ID), $(N_WORKERS) and $(PARALLEL_KEY)");
+			num_worker_threads = 1;
+		}
+		else
+		{
+			assert(num_worker_threads > 1);
+			if (strstr(sqldb_command, "$(WORKER_ID)") == NULL ||
+				strstr(sqldb_command, "$(N_WORKERS)") == NULL)
+				Elog("The custom SQL command has to contains $(WORKER_ID) and $(N_WORKERS) to avoid data duplications.\n"
+					 "example) SELECT * FROM my_table WHERE my_id %% $(N_WORKERS) = $(WORKER_ID)");
+			if (strstr(sqldb_command, "$(PARALLEL_KEY)") != NULL)
+				Elog("-n|--num-workers does not support $(PARALLEL_KEY) token.");
+		}
+	}
+	else
+	{
+		assert(simple_table_name);
+		if (num_worker_threads == 0)
+		{
+			/* -t TABLE without -n option */
+			num_worker_threads = 1;
+		}
+#ifndef __PG2ARROW__
+		else if (num_worker_threads > 1)
+		{
+			Elog("-t|--table with parallel execution is not supported");
+		}
+#endif
+	}
+	/* default segment size */
 	if (batch_segment_sz == 0)
 		batch_segment_sz = (1UL << 28);		/* 256MB in default */
+}
+
+/*
+ * sqldb_command_apply_worker_id
+ */
+const char *
+sqldb_command_apply_worker_id(const char *command, int worker_id)
+{
+	const char *src = command;
+	size_t	len = strlen(command) + 100;
+	size_t	off = 0;
+	char   *buf = palloc(len);
+	int		c;
+
+	while ((c = *src++) != '\0')
+	{
+		if (c == '$')
+		{
+			char	temp[100];
+			const char *tok = NULL;
+
+			if (strncmp(src, "(WORKER_ID)", 11) == 0)
+			{
+				sprintf(temp, "%d", worker_id);
+				src += 11;
+				tok = temp;
+			}
+			else if (strncmp(src, "(N_WORKERS)", 11) == 0)
+			{
+				sprintf(temp, "%d", num_worker_threads);
+				src += 11;
+				tok = temp;
+			}
+			else if (strncmp(src, "(PARALLEL_KEY)", 14) == 0)
+			{
+				if (worker_dist_keys && worker_dist_keys[worker_id])
+				{
+					src += 14;
+					tok = worker_dist_keys[worker_id];
+				}
+			}
+
+			if (tok)
+			{
+				size_t	sz = strlen(tok);
+
+				if (off + sz + 1 >= len)
+				{
+					len = (off + sz) + len;
+					buf = repalloc(buf, len);
+				}
+				strcpy(buf + off, tok);
+				off += sz;
+				continue;
+			}
+		}
+		if (off + 1 == len)
+		{
+			len += len;
+			buf = repalloc(buf, len);
+		}
+		buf[off++] = c;
+	}
+	buf[off++] = '\0';
+
+	return buf;
+}
+
+/*
+ * sql_table_merge_one_row
+ */
+static void
+mergeArrowChunkOneRow(SQLtable *dst_table,
+					  SQLtable *src_table, size_t src_index)
+{
+	size_t	usage = 0;
+
+	for (int j=0; j < src_table->nfields; j++)
+	{
+		usage += sql_field_move_value(&dst_table->columns[j],
+									  &src_table->columns[j], src_index);
+	}
+	dst_table->nitems++;
+	dst_table->usage = usage;
+}
+
+/*
+ * shows_record_batch_progress
+ */
+static void
+shows_record_batch_progress(const ArrowBlock *block,
+							int rb_index, size_t nitems,
+							int worker_id)
+{
+	time_t		tv = time(NULL);
+	struct tm	tm;
+	char		namebuf[100];
+
+	if (num_worker_threads == 1)
+		namebuf[0] = '\0';
+	else
+		sprintf(namebuf, " by worker:%d", worker_id);
+
+	localtime_r(&tv, &tm);
+	printf("%04d-%02d-%02d %02d:%02d:%02d "
+		   "RecordBatch[%d]: "
+		   "offset=%lu length=%lu (meta=%u, body=%lu) nitems=%zu%s\n",
+		   tm.tm_year + 1900,
+		   tm.tm_mon + 1,
+		   tm.tm_mday,
+		   tm.tm_hour,
+		   tm.tm_min,
+		   tm.tm_sec,
+		   rb_index,
+		   block->offset,
+		   block->metaDataLength + block->bodyLength,
+		   block->metaDataLength,
+		   block->bodyLength,
+		   nitems,
+		   namebuf);
+}
+
+/*
+ * execute_sql2arrow
+ */
+static void
+sql2arrow_common(void *sqldb_conn, uint32_t worker_id)
+{
+	SQLtable   *main_table = worker_tables[0];
+	SQLtable   *data_table = worker_tables[worker_id];
+	ArrowBlock	__block;
+	int			__rb_index;
+
+	/* fetch results and write record batches */
+	while (sqldb_fetch_results(sqldb_conn, data_table))
+	{
+		if (data_table->usage >= batch_segment_sz)
+		{
+			__rb_index = writeArrowRecordBatchMT(main_table,
+												 data_table,
+												 &main_table_mutex,
+												 &__block);
+			if (shows_progress)
+				shows_record_batch_progress(&__block,
+											__rb_index,
+											data_table->nitems,
+											worker_id);
+			sql_table_clear(data_table);
+		}
+	}
+	/* wait and merge results */
+	for (uint32_t k=1; (worker_id & k) == 0; k <<= 1)
+	{
+		uint32_t	buddy = (worker_id | k);
+		SQLtable   *buddy_table;
+
+		if (buddy >= num_worker_threads)
+			break;
+		if ((errno = pthread_join(worker_threads[buddy], NULL)) != 0)
+			Elog("failed on pthread_join[%u]: %m", buddy);
+
+		buddy_table = worker_tables[buddy];
+		for (size_t i=0; i < buddy_table->nitems; i++)
+		{
+			/* merge one row */
+			mergeArrowChunkOneRow(data_table, buddy_table, i);
+			/* write out buffer */
+			if (data_table->usage >= batch_segment_sz)
+			{
+				__rb_index = writeArrowRecordBatchMT(main_table,
+													 data_table,
+													 &main_table_mutex,
+													 &__block);
+				if (shows_progress)
+					shows_record_batch_progress(&__block,
+												__rb_index,
+												data_table->nitems,
+												worker_id);
+				sql_table_clear(data_table);
+			}
+		}
+		if (shows_progress && buddy_table->nitems > 0)
+			printf("worker:%u merged pending results by worker:%u\n",
+				   worker_id, buddy);
+	}
+}
+
+/*
+ * worker_main
+ */
+static void *
+worker_main(void *__worker_id)
+{
+	uintptr_t	worker_id = (uintptr_t)__worker_id;
+	SQLtable   *main_table;
+	SQLtable   *data_table;
+	void	   *sqldb_conn;
+	const char *worker_command;
+
+	/* wait for the initial setup */
+	pthread_mutex_lock(&worker_setup_mutex);
+	while (!worker_setup_done)
+	{
+		pthread_cond_wait(&worker_setup_cond,
+						  &worker_setup_mutex);
+	}
+	pthread_mutex_unlock(&worker_setup_mutex);
+
+	/*
+	 * OK, now worker:0 already has started.
+	 */
+	main_table = worker_tables[0];
+	sqldb_conn = sqldb_server_connect(sqldb_hostname,
+									  sqldb_port_num,
+									  sqldb_username,
+									  sqldb_password,
+									  sqldb_database,
+									  sqldb_session_configs,
+									  sqldb_nestloop_options);
+	worker_command = sqldb_command_apply_worker_id(sqldb_command, worker_id);
+	if (shows_progress)
+		printf("worker:%lu SQL=[%s]\n", worker_id, worker_command);
+	data_table = sqldb_begin_query(sqldb_conn,
+								   worker_command,
+								   NULL,
+								   main_table->sql_dict_list);
+	if (!data_table)
+		Elog("Empty results by the query: %s", worker_command);
+	data_table->segment_sz = batch_segment_sz;
+	/* enables embedded min/max statistics, if any */
+	enable_embedded_stats(data_table);
+	/* check compatibility */
+	if (!IsSQLtableCompatible(main_table, data_table))
+		Elog("Schema definition by the query in worker:%lu is not compatible: %s",
+			 worker_id, worker_command);
+	worker_tables[worker_id] = data_table;
+	/* main loop to fetch and write results */
+	sql2arrow_common(sqldb_conn, worker_id);
+	/* close the connection */
+	sqldb_close_connection(sqldb_conn);
+
+	if (shows_progress)
+		printf("worker:%lu terminated\n", worker_id);
+
+	return NULL;
 }
 
 /*
@@ -871,25 +1492,42 @@ int main(int argc, char * const argv[])
 {
 	int				append_fdesc = -1;
 	ArrowFileInfo	af_info;
-	void		   *sqldb_state;
+	void		   *sqldb_conn;
+	const char	   *main_command;
 	SQLtable	   *table;
 	ArrowKeyValue  *kv;
 	SQLdictionary  *sql_dict_list = NULL;
-	
+	time_t			tv1 = time(NULL);
+
 	parse_options(argc, argv);
 
 	/* special case if --dump=FILENAME */
 	if (dump_arrow_filename)
 		return dumpArrowFile(dump_arrow_filename);
-
+	/* special case if --schema=FILENAME */
+	if (schema_arrow_filename)
+		return schemaArrowFile(schema_arrow_filename,
+							   schema_arrow_tablename);
+	/* setup workers */
+	assert(num_worker_threads > 0);
+	worker_threads = palloc0(sizeof(pthread_t)  * num_worker_threads);
+	worker_tables  = palloc0(sizeof(SQLtable *) * num_worker_threads);
+	for (uintptr_t i = 1; i < num_worker_threads; i++)
+	{
+		if ((errno = pthread_create(&worker_threads[i],
+									NULL,
+									worker_main,
+									(void *)i)) != 0)
+			Elog("failed on pthread_create: %m");
+	}
 	/* open connection */
-	sqldb_state = sqldb_server_connect(sqldb_hostname,
-									   sqldb_port_num,
-									   sqldb_username,
-									   sqldb_password,
-									   sqldb_database,
-									   sqldb_session_configs,
-									   sqldb_nestloop_options);
+	sqldb_conn = sqldb_server_connect(sqldb_hostname,
+									  sqldb_port_num,
+									  sqldb_username,
+									  sqldb_password,
+									  sqldb_database,
+									  sqldb_session_configs,
+									  sqldb_nestloop_options);
 	/* read the original arrow file, if --append mode */
 	if (append_filename)
 	{
@@ -899,9 +1537,23 @@ int main(int argc, char * const argv[])
 		readArrowFileDesc(append_fdesc, &af_info);
 		sql_dict_list = loadArrowDictionaryBatches(append_fdesc, &af_info);
 	}
+	/* build simple table-scan query command */
+	if (simple_table_name)
+	{
+		assert(!sqldb_command);
+		sqldb_command = sqldb_build_simple_command(sqldb_conn,
+												   simple_table_name,
+												   num_worker_threads,
+												   batch_segment_sz);
+		if (!sqldb_command)
+			Elog("out of memory");
+	}
 	/* begin SQL command execution */
-	table = sqldb_begin_query(sqldb_state,
-							  sqldb_command,
+	main_command = sqldb_command_apply_worker_id(sqldb_command, 0);
+	if (shows_progress)
+		printf("worker:0 SQL=[%s]\n", main_command);
+	table = sqldb_begin_query(sqldb_conn,
+							  main_command,
 							  append_filename ? &af_info : NULL,
 							  sql_dict_list);
 	if (!table)
@@ -931,30 +1583,58 @@ int main(int argc, char * const argv[])
 	}
 	/* write out dictionary batch, if any */
 	writeArrowDictionaryBatches(table);
-	
-	/* main loop to fetch and write result */
-	while (sqldb_fetch_results(sqldb_state, table))
-	{
-		if (table->usage > batch_segment_sz)
-		{
-			writeArrowRecordBatch(table);
-			shows_record_batch_progress(table, table->nitems);
-			sql_table_clear(table);
-		}
-	}
+	/* the primary SQLtable become visible to other workers */
+	pthread_mutex_lock(&worker_setup_mutex);
+	worker_tables[0] = table;
+	worker_setup_done = true;
+	pthread_cond_broadcast(&worker_setup_cond);
+	pthread_mutex_unlock(&worker_setup_mutex);
+	/* main loop to fetch and write results*/
+	sql2arrow_common(sqldb_conn, 0);
 	if (table->nitems > 0)
 	{
-		writeArrowRecordBatch(table);
-		shows_record_batch_progress(table, table->nitems);
+		ArrowBlock	__block;
+		int			__rb_index;
+
+		__rb_index = writeArrowRecordBatch(table, &__block);
+		if (shows_progress)
+			shows_record_batch_progress(&__block,
+										__rb_index,
+										table->nitems,
+										0);
 		sql_table_clear(table);
+	}
+
+	/* check whether any results were written */
+	if (table->numRecordBatches == 0)
+	{
+		if (!append_filename)
+			unlink(table->filename);
+		Elog("SQL query has empty results: %s", sqldb_command);
 	}
 	/* write out footer portion */
 	writeArrowFooter(table);
 
 	/* cleanup */
-	sqldb_close_connection(sqldb_state);
+	sqldb_close_connection(sqldb_conn);
 	close(table->fdesc);
 
+	if (shows_progress)
+	{
+		time_t	elapsed = (time(NULL) - tv1);
+
+		if (elapsed > 2 * 86400)	/* > 2days */
+			printf("Total elapsed time: %ld days %02ld:%02ld:%02ld\n",
+				   elapsed / 86400,
+				   (elapsed % 86400) / 3600,
+				   (elapsed % 3600) / 60,
+				   (elapsed % 60));
+		else
+			printf("Total elapsed time: %02ld:%02ld:%02ld\n",
+				   (elapsed % 86400) / 3600,
+				   (elapsed % 3600) / 60,
+				   (elapsed % 60));
+	}
 	return 0;
 }
 

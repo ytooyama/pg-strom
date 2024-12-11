@@ -36,6 +36,7 @@ static long				dpuserv_num_workers = -1;
 static char			   *dpuserv_identifier = NULL;
 static const char	   *dpuserv_logfile = NULL;
 static bool				verbose = false;
+static bool				use_direct_io = false;
 static pthread_mutex_t	dpu_client_mutex;
 static dlist_head		dpu_client_list;
 static pthread_mutex_t	dpu_command_mutex;
@@ -69,8 +70,6 @@ struct dpuTaskExecState
 	} stats[1];
 };
 typedef struct dpuTaskExecState		dpuTaskExecState;
-
-
 
 /*
  * dpuClientWriteBack
@@ -157,9 +156,9 @@ dpuClientWriteBack(dpuClient *dclient,
 		size_t		sz1, sz2;
 
 		assert(kds->format == KDS_FORMAT_ROW);
-		sz1 = KDS_HEAD_LENGTH(kds) + MAXALIGN(sizeof(uint32_t) * kds->nitems);
-		sz2 = __kds_unpack(kds->usage);
-		if (sz1 + sz2 == kds->length)
+		sz1 = KDS_HEAD_LENGTH(kds) + MAXALIGN(sizeof(uint64_t) * kds->nitems);
+		sz2 = kds->usage;
+		if (sz1 + sz2 >= kds->length)
 		{
 			iov = &iov_array[iovcnt++];
 			iov->iov_base = kds;
@@ -229,7 +228,7 @@ __dpuClientElog(dpuClient *dclient,
 }
 
 #define dpuClientElog(dclient,fmt,...)			\
-	__dpuClientElog((dclient), ERRCODE_DEVICE_INTERNAL,	\
+	__dpuClientElog((dclient), ERRCODE_DEVICE_ERROR,	\
 					__FILE__, __LINE__, __FUNCTION__,	\
 					(fmt), ##__VA_ARGS__)
 /*
@@ -684,9 +683,12 @@ __dpuservLoadKdsCommon(dpuClient *dclient,
 	kern_data_store *kds;
 	char	   *data;
 	char	   *end		__attribute__((unused));
+	int			flags = O_RDONLY | O_NOATIME;
 	int			fdesc;
 
-	fdesc = open(pathname, O_RDONLY | O_DIRECT | O_NOATIME);
+	if (use_direct_io)
+		flags |= O_DIRECT;
+	fdesc = open(pathname, flags);
 	if (fdesc < 0)
 	{
 		dpuClientElog(dclient, "failed on open('%s'): %m", pathname);
@@ -785,10 +787,12 @@ dpuservLoadKdsArrow(dpuClient *dclient,
 					const strom_io_vector *kds_iovec,
 					char **p_base_addr)
 {
+	size_t		preload_sz = (KDS_HEAD_LENGTH(kds_head) +
+							  kds_head->arrow_virtual_usage);
 	Assert(kds_head->format == KDS_FORMAT_ARROW);
 	return __dpuservLoadKdsCommon(dclient,
 								  kds_head,
-								  KDS_HEAD_LENGTH(kds_head),
+								  preload_sz,
 								  pathname,
 								  kds_iovec,
 								  p_base_addr);
@@ -858,16 +862,16 @@ __handleDpuTaskExecProjection(dpuClient *dclient,
 			dtes->kds_dst = kds_dst;
 		}
 		/* insert a tuple */
-		offset = __kds_unpack(kds_dst->usage) + tupsz;
+		offset = kds_dst->usage + tupsz;
 		newsz = (KDS_HEAD_LENGTH(kds_dst) +
-				 MAXALIGN(sizeof(uint32_t) * (kds_dst->nitems + 1)) +
+				 MAXALIGN(sizeof(uint64_t) * (kds_dst->nitems + 1)) +
 				 offset);
 		if (newsz > kds_dst->length)
 		{
 			dtes->kds_dst = kds_dst = NULL;
 			goto retry;
 		}
-		kds_dst->usage = __kds_packed(offset);
+		kds_dst->usage = offset;
 		rowid = kds_dst->nitems++;
 		KDS_GET_ROWINDEX(kds_dst)[rowid] = kds_dst->usage;
 		tupitem = (kern_tupitem *)
@@ -1079,9 +1083,11 @@ __insertOneTupleNoGroups(kern_context *kcxt,
 {
 	kern_tupitem   *tupitem;
 	int32_t			tupsz;
-	uint32_t		required;
-	uint32_t		usage;
-	size_t			total_sz;
+	int32_t			required;
+	uint64_t		__usage;
+	uint32_t		__nitems_old;
+	uint32_t		__nitems_cur;
+	uint32_t		__nitems_new;
 
 	assert(kds_final->format == KDS_FORMAT_ROW &&
 		   kds_final->nitems == 0 &&
@@ -1091,25 +1097,33 @@ __insertOneTupleNoGroups(kern_context *kcxt,
 									 kexp_groupby_actions);
 	assert(tupsz > 0);
 	required = MAXALIGN(offsetof(kern_tupitem, htup) + tupsz);
-	total_sz = (KDS_HEAD_LENGTH(kds_final) +
-				MAXALIGN(sizeof(uint32_t)) +
-				required + __kds_unpack(kds_final->usage));
-	if (total_sz > kds_final->length)
-		return NULL;	/* out of memory */
-	usage = __atomic_add_uint32(&kds_final->usage, __kds_packed(required));
+	/* expand kds_final */
+	__usage = __atomic_add_uint64(&kds_final->usage, required);
+	__nitems_cur = __volatileRead(&kds_final->nitems);
+	do {
+		__nitems_old = __nitems_cur;
+		__nitems_new = __nitems_cur + 1;
+		if (!__KDS_CHECK_OVERFLOW(kds_final,
+								  __nitems_new,
+								  __usage + required))
+			return NULL;    /* out of memory */
+	} while ((__nitems_cur = __atomic_cas_uint32(&kds_final->nitems,
+												 __nitems_old,
+												 __nitems_new)) != __nitems_old);
+    /* ok, both nitems and usage are valid to write */
 	tupitem = (kern_tupitem *)((char *)kds_final
 							   + kds_final->length
-							   - __kds_unpack(usage)
+							   - __usage
 							   - required);
 	__writeOutOneTuplePreAgg(kcxt, kds_final,
 							 &tupitem->htup,
 							 kexp_groupby_actions);
 	tupitem->t_len = tupsz;
-	tupitem->rowid = 0;
-	KDS_GET_ROWINDEX(kds_final)[kds_final->nitems++]
-		= __kds_packed((char *)kds_final
-					   + kds_final->length
-					   - (char *)tupitem);
+	tupitem->rowid = __nitems_new - 1;
+	KDS_GET_ROWINDEX(kds_final)[tupitem->rowid]
+		= (uint64_t)((char *)kds_final
+					 + kds_final->length
+					 - (char *)tupitem);
 	return tupitem;
 }
 
@@ -1123,14 +1137,11 @@ __insertOneTupleGroupBy(kern_context *kcxt,
 {
 	kern_hashitem  *hitem;
 	int32_t			tupsz;
-	uint32_t		required;
-	union {
-		uint64_t	u64;
-		struct {
-			uint32_t nitems;
-			uint32_t usage;
-		} kds;
-	} oldval, curval, newval;
+	int32_t			required;
+	uint64_t		__usage;
+	uint32_t		__nitems_old;
+	uint32_t		__nitems_cur;
+	uint32_t		__nitems_new;
 
 	assert(kds_final->format == KDS_FORMAT_HASH &&
 		   kds_final->hash_nslots > 0);
@@ -1141,39 +1152,32 @@ __insertOneTupleGroupBy(kern_context *kcxt,
 	required = MAXALIGN(offsetof(kern_hashitem, t.htup) + tupsz);
 
 	/* expand kds_final */
-	curval.kds.nitems = __volatileRead(&kds_final->nitems);
-	curval.kds.usage  = __volatileRead(&kds_final->usage);
-	for (;;)
-	{
-		size_t		total_sz;
-
-		newval.kds.nitems = curval.kds.nitems + 1;
-		newval.kds.usage  = curval.kds.usage  + __kds_packed(required);
-		total_sz = (KDS_HEAD_LENGTH(kds_final) +
-					MAXALIGN(sizeof(uint32_t) * (kds_final->hash_nslots +
-												 newval.kds.nitems)) +
-					__kds_unpack(curval.kds.usage));
-		if (total_sz > kds_final->length)
+	__usage = __atomic_add_uint64(&kds_final->usage, required);
+	__nitems_cur = __volatileRead(&kds_final->nitems);
+	do {
+		__nitems_old = __nitems_cur;
+		__nitems_new = __nitems_cur + 1;
+		if (!__KDS_CHECK_OVERFLOW(kds_final,
+								  __nitems_new,
+								  __usage + required))
 			return NULL;	/* out of memory */
-		oldval.u64 = __atomic_cas_uint64((uint64_t *)&kds_final->nitems,
-										 curval.u64,
-										 newval.u64);
-		if (oldval.u64 == curval.u64)
-			break;
-		curval.u64 = oldval.u64;
-	}
+	} while ((__nitems_cur = __atomic_cas_uint32(&kds_final->nitems,
+												 __nitems_old,
+												 __nitems_new)) != __nitems_old);
+	/* ok, both nitems and usage are valid to write */
 	hitem = (kern_hashitem *)((char *)kds_final
 							  + kds_final->length
-							  - __kds_unpack(newval.kds.usage));
+							  - __usage
+							  - required);
 	__writeOutOneTuplePreAgg(kcxt, kds_final,
 							 &hitem->t.htup,
 							 kexp_groupby_actions);
 	hitem->t.t_len = tupsz;
-	hitem->t.rowid = newval.kds.nitems - 1;
+	hitem->t.rowid = __nitems_new - 1;
 	KDS_GET_ROWINDEX(kds_final)[hitem->t.rowid]
-		= __kds_packed((char *)kds_final
-					   + kds_final->length
-					   - (char *)&hitem->t);
+		= ((char *)kds_final
+		   + kds_final->length
+		   - (char *)&hitem->t);
 	return hitem;
 }
 
@@ -1198,7 +1202,7 @@ __update_preagg__nrows_cond(kern_context *kcxt,
 							kern_colmeta *cmeta,
 							kern_aggregate_desc *desc)
 {
-	xpu_datum_t	   *xdatum = kcxt->kvars_slot[desc->arg0_slot_id];
+	const xpu_datum_t  *xdatum = kcxt->kvars_slot[desc->arg0_slot_id];
 
 	if (!XPU_DATUM_ISNULL(xdatum))
 		__atomic_add_uint64((uint64_t *)buffer, 1);
@@ -1213,16 +1217,16 @@ __update_preagg__pmin_int32(kern_context *kcxt,
 							kern_colmeta *cmeta,
 							kern_aggregate_desc *desc)
 {
-	xpu_int4_t	   *xdatum = (xpu_int4_t *)
-		kcxt->kvars_slot[desc->arg0_slot_id];
+	const xpu_datum_t  *xdatum = kcxt->kvars_slot[desc->arg0_slot_id];
+	int32_t		ival;
 
-	if (!XPU_DATUM_ISNULL(xdatum))
+	if (__preagg_fetch_xdatum_as_int32(&ival, xdatum))
 	{
 		kagg_state__pminmax_int64_packed *r =
 			(kagg_state__pminmax_int64_packed *)buffer;
-		assert(xdatum->expr_ops == &xpu_int4_ops);
+
 		__atomic_add_uint32(&r->nitems, 1);
-		__atomic_min_int64(&r->value, xdatum->value);
+		__atomic_min_int64(&r->value, ival);
 	}
 }
 
@@ -1232,16 +1236,16 @@ __update_preagg__pmin_int64(kern_context *kcxt,
 							kern_colmeta *cmeta,
 							kern_aggregate_desc *desc)
 {
-	xpu_int8_t	   *xdatum = (xpu_int8_t *)
-		kcxt->kvars_slot[desc->arg0_slot_id];
+	const xpu_datum_t  *xdatum = kcxt->kvars_slot[desc->arg0_slot_id];
+	int64_t		ival;
 
-	if (!XPU_DATUM_ISNULL(xdatum))
+	if (__preagg_fetch_xdatum_as_int64(&ival, xdatum))
 	{
 		kagg_state__pminmax_int64_packed *r =
 			(kagg_state__pminmax_int64_packed *)buffer;
-		assert(xdatum->expr_ops == &xpu_int8_ops);
+
 		__atomic_add_uint32(&r->nitems, 1);
-		__atomic_min_int64(&r->value, xdatum->value);
+		__atomic_min_int64(&r->value, ival);
 	}
 }
 
@@ -1254,16 +1258,16 @@ __update_preagg__pmax_int32(kern_context *kcxt,
 							kern_colmeta *cmeta,
 							kern_aggregate_desc *desc)
 {
-	xpu_int4_t	   *xdatum = (xpu_int4_t *)
-		kcxt->kvars_slot[desc->arg0_slot_id];
+	const xpu_datum_t  *xdatum = kcxt->kvars_slot[desc->arg0_slot_id];
+	int32_t		ival;
 
-	if (!XPU_DATUM_ISNULL(xdatum))
+	if (__preagg_fetch_xdatum_as_int32(&ival, xdatum))
 	{
 		kagg_state__pminmax_int64_packed *r =
 			(kagg_state__pminmax_int64_packed *)buffer;
-		assert(xdatum->expr_ops == &xpu_int4_ops);
+
 		__atomic_add_uint32(&r->nitems, 1);
-		__atomic_max_int64(&r->value, xdatum->value);
+		__atomic_max_int64(&r->value, ival);
 	}
 }
 
@@ -1273,16 +1277,16 @@ __update_preagg__pmax_int64(kern_context *kcxt,
 							kern_colmeta *cmeta,
 							kern_aggregate_desc *desc)
 {
-	xpu_int8_t	   *xdatum = (xpu_int8_t *)
-		kcxt->kvars_slot[desc->arg0_slot_id];
+	const xpu_datum_t  *xdatum = kcxt->kvars_slot[desc->arg0_slot_id];
+	int64_t		ival;
 
-	if (!XPU_DATUM_ISNULL(xdatum))
+	if (__preagg_fetch_xdatum_as_int64(&ival, xdatum))
 	{
 		kagg_state__pminmax_int64_packed *r =
 			(kagg_state__pminmax_int64_packed *)buffer;
-		assert(xdatum->expr_ops == &xpu_int8_ops);
+
 		__atomic_add_uint32(&r->nitems, 1);
-		__atomic_max_int64(&r->value, xdatum->value);
+		__atomic_max_int64(&r->value, ival);
 	}
 }
 
@@ -1295,16 +1299,16 @@ __update_preagg__pmin_fp64(kern_context *kcxt,
 						   kern_colmeta *cmeta,
 						   kern_aggregate_desc *desc)
 {
-	xpu_float8_t   *xdatum = (xpu_float8_t *)
-		kcxt->kvars_slot[desc->arg0_slot_id];
+	const xpu_datum_t  *xdatum = kcxt->kvars_slot[desc->arg0_slot_id];
+	float8_t	fval;
 
-	if (!XPU_DATUM_ISNULL(xdatum))
+	if (__preagg_fetch_xdatum_as_float64(&fval, xdatum))
 	{
 		kagg_state__pminmax_fp64_packed *r =
 			(kagg_state__pminmax_fp64_packed *)buffer;
-		assert(xdatum->expr_ops == &xpu_float8_ops);
+
 		__atomic_add_uint32(&r->nitems, 1);
-		__atomic_min_fp64(&r->value, xdatum->value);
+		__atomic_min_fp64(&r->value, fval);
 	}
 }
 
@@ -1317,16 +1321,16 @@ __update_preagg__pmax_fp64(kern_context *kcxt,
 						   kern_colmeta *cmeta,
 						   kern_aggregate_desc *desc)
 {
-	xpu_float8_t   *xdatum = (xpu_float8_t *)
-		kcxt->kvars_slot[desc->arg0_slot_id];
+	const xpu_datum_t  *xdatum = kcxt->kvars_slot[desc->arg0_slot_id];
+	float8_t	fval;
 
-	if (!XPU_DATUM_ISNULL(xdatum))
+	if (__preagg_fetch_xdatum_as_float64(&fval, xdatum))
 	{
 		kagg_state__pminmax_fp64_packed *r =
 			(kagg_state__pminmax_fp64_packed *)buffer;
-		assert(xdatum->expr_ops == &xpu_float8_ops);
+
 		__atomic_add_uint32(&r->nitems, 1);
-		__atomic_min_fp64(&r->value, xdatum->value);
+		__atomic_max_fp64(&r->value, fval);
 	}
 }
 
@@ -1339,16 +1343,16 @@ __update_preagg__psum_int(kern_context *kcxt,
 						  kern_colmeta *cmeta,
 						  kern_aggregate_desc *desc)
 {
-	xpu_int8_t	   *xdatum = (xpu_int8_t *)
-		kcxt->kvars_slot[desc->arg0_slot_id];
+	const xpu_datum_t  *xdatum = kcxt->kvars_slot[desc->arg0_slot_id];
+	int64_t		ival;
 
-	if (!XPU_DATUM_ISNULL(xdatum))
+	if (__preagg_fetch_xdatum_as_int64(&ival, xdatum))
 	{
 		kagg_state__psum_int_packed *r =
 			(kagg_state__psum_int_packed *)buffer;
-		assert(xdatum->expr_ops == &xpu_int8_ops);
+
 		__atomic_add_uint32(&r->nitems, 1);
-		__atomic_add_int64(&r->sum, xdatum->value);
+		__atomic_add_int64(&r->sum, ival);
 	}
 }
 
@@ -1361,16 +1365,16 @@ __update_preagg__psum_fp(kern_context *kcxt,
 						 kern_colmeta *cmeta,
 						 kern_aggregate_desc *desc)
 {
-	xpu_float8_t   *xdatum = (xpu_float8_t *)
-		kcxt->kvars_slot[desc->arg0_slot_id];
+	const xpu_datum_t  *xdatum = kcxt->kvars_slot[desc->arg0_slot_id];
+	float8_t	fval;
 
-	if (!XPU_DATUM_ISNULL(xdatum))
+	if (__preagg_fetch_xdatum_as_float64(&fval, xdatum))
 	{
 		kagg_state__psum_fp_packed *r =
 			(kagg_state__psum_fp_packed *)buffer;
-		assert(xdatum->expr_ops == &xpu_float8_ops);
+
 		__atomic_add_uint32(&r->nitems, 1);
-		__atomic_add_fp64(&r->sum, xdatum->value);
+		__atomic_add_fp64(&r->sum, fval);
 	}
 }
 
@@ -1383,17 +1387,17 @@ __update_preagg__pstddev(kern_context *kcxt,
 						 kern_colmeta *cmeta,
 						 kern_aggregate_desc *desc)
 {
-	xpu_float8_t   *xdatum = (xpu_float8_t *)
-		kcxt->kvars_slot[desc->arg0_slot_id];
+	const xpu_datum_t  *xdatum = kcxt->kvars_slot[desc->arg0_slot_id];
+	float8_t	fval;
 
-	if (!XPU_DATUM_ISNULL(xdatum))
+	if (__preagg_fetch_xdatum_as_float64(&fval, xdatum))
 	{
 		kagg_state__stddev_packed *r =
 			(kagg_state__stddev_packed *)buffer;
-		assert(xdatum->expr_ops == &xpu_float8_ops);
+
 		__atomic_add_uint32(&r->nitems, 1);
-		__atomic_add_fp64(&r->sum_x,  xdatum->value);
-		__atomic_add_fp64(&r->sum_x2, xdatum->value * xdatum->value);
+		__atomic_add_fp64(&r->sum_x,  fval);
+		__atomic_add_fp64(&r->sum_x2, fval * fval);
 	}
 }
 
@@ -1406,23 +1410,22 @@ __update_preagg__pcovar(kern_context *kcxt,
 						kern_colmeta *cmeta,
 						kern_aggregate_desc *desc)
 {
-	xpu_float8_t   *xdatum = (xpu_float8_t *)
-		kcxt->kvars_slot[desc->arg0_slot_id];
-	xpu_float8_t   *ydatum = (xpu_float8_t *)
-		kcxt->kvars_slot[desc->arg1_slot_id];
+	const xpu_datum_t  *xdatum = kcxt->kvars_slot[desc->arg0_slot_id];
+	const xpu_datum_t  *ydatum = kcxt->kvars_slot[desc->arg1_slot_id];
+	float8_t	xval, yval;
 
-	if (!XPU_DATUM_ISNULL(xdatum) && !XPU_DATUM_ISNULL(ydatum))
+	if (__preagg_fetch_xdatum_as_float64(&xval, xdatum) &&
+		__preagg_fetch_xdatum_as_float64(&yval, ydatum))
 	{
 		kagg_state__covar_packed *r =
 			(kagg_state__covar_packed *)buffer;
-		assert(xdatum->expr_ops == &xpu_float8_ops &&
-			   ydatum->expr_ops == &xpu_float8_ops);
+
 		__atomic_add_uint32(&r->nitems, 1);
-		__atomic_add_fp64(&r->sum_x,  xdatum->value);
-		__atomic_add_fp64(&r->sum_xx, xdatum->value * xdatum->value);
-		__atomic_add_fp64(&r->sum_y,  ydatum->value);
-		__atomic_add_fp64(&r->sum_yy, ydatum->value * ydatum->value);
-		__atomic_add_fp64(&r->sum_xy, xdatum->value * ydatum->value);
+		__atomic_add_fp64(&r->sum_x,  xval);
+		__atomic_add_fp64(&r->sum_xx, xval * xval);
+		__atomic_add_fp64(&r->sum_y,  yval);
+		__atomic_add_fp64(&r->sum_yy, yval * yval);
+		__atomic_add_fp64(&r->sum_xy, xval * yval);
 	}
 }
 
@@ -1534,13 +1537,13 @@ expandGroupByFinalBuffer(groupby_final_buffer *gf_buf)
 		return false;
 	/* early half */
 	sz = (KDS_HEAD_LENGTH(kds_old) +
-		  MAXALIGN(sizeof(uint32_t) * (kds_old->nitems +
+		  MAXALIGN(sizeof(uint64_t) * (kds_old->nitems +
 									   kds_old->hash_nslots)));
 	memcpy(kds_new, kds_old, sz);
 	kds_new->length = length;
 
 	/* later falf */
-	sz = __kds_unpack(kds_old->usage);
+	sz = kds_old->usage;
 	memcpy((char *)kds_new + kds_new->length - sz,
 		   (char *)kds_old + kds_old->length - sz, sz);
 
@@ -1665,12 +1668,12 @@ __handleDpuTaskExecGroupByPreAgg(dpuClient *dclient,
 	kds_final = gf_buf->kds_final;
 	assert(kds_final->format == KDS_FORMAT_HASH);
 	do {
-		uint32_t   *hslot = KDS_GET_HASHSLOT(kds_final, hash.value);
-		uint32_t	hoffset = __volatileRead(hslot);
-		uint32_t	saved = hoffset;
+		uint64_t   *hslot = KDS_GET_HASHSLOT(kds_final, hash.value);
+		uint64_t	hoffset = __volatileRead(hslot);
+		uint64_t	saved = hoffset;
 		xpu_bool_t	status;
 
-		if (hoffset == UINT_MAX)
+		if (hoffset == ULONG_MAX)
 		{
 			/* someone already hold the hslot-lock */
 			sched_yield();
@@ -1701,7 +1704,7 @@ __handleDpuTaskExecGroupByPreAgg(dpuClient *dclient,
 			kcxt->kmode_compare_nulls = saved_compare_nulls;
 		}
 
-		if (!hitem && __atomic_cas_uint32(hslot, saved, UINT_MAX) == saved)
+		if (!hitem && __atomic_cas_uint64(hslot, saved, ULONG_MAX) == saved)
 		{
 			/* hslot-lock is now acquired */
 			hitem = __insertOneTupleGroupBy(kcxt, kds_final,
@@ -1714,13 +1717,13 @@ __handleDpuTaskExecGroupByPreAgg(dpuClient *dclient,
 						   + kds_final->length
 						   - (char *)hitem);
 				/* insert and unlock */
-				__atomic_write_uint32(hslot, __kds_packed(hoffset));
+				__atomic_write_uint64(hslot, hoffset);
 				break;
 			}
 			else
 			{
 				/* unlock; by out of the memory */
-				__atomic_write_uint32(hslot, saved);
+				__atomic_write_uint64(hslot, saved);
 				if (!has_exclusive)
 				{
 					pthreadRWLockUnlock(&gf_buf->kds_final_rwlock);
@@ -1768,22 +1771,17 @@ __handleDpuTaskExecNestLoop(dpuClient *dclient,
 {
 	kern_session_info  *session = dclient->session;
 	kern_multirels	   *kmrels = dclient->kmrels;
-	kern_data_store	   *kds_heap = KERN_MULTIRELS_INNER_KDS(kmrels,depth-1);
-	bool			   *oj_map = KERN_MULTIRELS_OUTER_JOIN_MAP(kmrels,depth-1);
+	kern_data_store	   *kds_heap = KERN_MULTIRELS_INNER_KDS(kmrels,depth);
+	bool			   *oj_map = KERN_MULTIRELS_OUTER_JOIN_MAP(kmrels,depth);
 	kern_expression	   *kexp_load_vars = SESSION_KEXP_LOAD_VARS(session,depth);
 	kern_expression	   *kexp_join_quals = SESSION_KEXP_JOIN_QUALS(session,depth);
 	bool				matched = false;
 
 	for (uint32_t rowid=0; rowid < kds_heap->nitems; rowid++)
 	{
-		kern_tupitem   *tupitem;
-		uint32_t		offset;
+		kern_tupitem   *tupitem = KDS_GET_TUPITEM(kds_heap, rowid);
 		xpu_int4_t		status;
 
-		offset = KDS_GET_ROWINDEX(kds_heap)[rowid];
-		tupitem = (kern_tupitem *)((char *)kds_heap +
-								   kds_heap->length -
-								   __kds_unpack(offset));
 		kcxt_reset(kcxt);
 		ExecLoadVarsHeapTuple(kcxt, kexp_load_vars, depth,
 							  kds_heap, &tupitem->htup);
@@ -1847,8 +1845,8 @@ __handleDpuTaskExecHashJoin(dpuClient *dclient,
 {
 	kern_session_info  *session = dclient->session;
 	kern_multirels	   *kmrels = dclient->kmrels;
-	kern_data_store	   *kds_hash = KERN_MULTIRELS_INNER_KDS(kmrels, depth-1);
-	bool			   *oj_map = KERN_MULTIRELS_OUTER_JOIN_MAP(kmrels, depth-1);
+	kern_data_store	   *kds_hash = KERN_MULTIRELS_INNER_KDS(kmrels, depth);
+	bool			   *oj_map = KERN_MULTIRELS_OUTER_JOIN_MAP(kmrels, depth);
 	kern_expression	   *kexp_load_vars = SESSION_KEXP_LOAD_VARS(session,depth);
 	kern_expression	   *kexp_join_quals = SESSION_KEXP_JOIN_QUALS(session,depth);
 	kern_expression	   *kexp_hash_value = SESSION_KEXP_HASH_VALUE(session,depth);
@@ -1924,7 +1922,8 @@ __handleDpuTaskExecHashJoin(dpuClient *dclient,
 static bool
 __handleDpuScanExecBlock(dpuClient *dclient,
 						 dpuTaskExecState *dtes,
-						 kern_data_store *kds_src)
+						 kern_data_store *kds_src,
+						 kern_data_store *kds_fallback)
 {
 	kern_session_info  *session = dclient->session;
 	kern_multirels	   *kmrels = dclient->kmrels;
@@ -1933,10 +1932,10 @@ __handleDpuScanExecBlock(dpuClient *dclient,
 	kern_context	   *kcxt;
 	uint32_t			block_index;
 
-	assert(kds_src->format == KDS_FORMAT_BLOCK &&
-		   kexp_load_vars->opcode == FuncOpCode__LoadVars);
+	assert(kds_src->format == KDS_FORMAT_BLOCK);
 	assert(!kmrels || kmrels->num_rels > 0);
-	INIT_KERNEL_CONTEXT(kcxt, session);
+	INIT_KERNEL_CONTEXT(kcxt, session, kds_fallback);
+
 	for (block_index = 0; block_index < kds_src->nitems; block_index++)
 	{
 		PageHeaderData *page = KDS_BLOCK_PGPAGE(kds_src, block_index);
@@ -1996,7 +1995,8 @@ __handleDpuScanExecBlock(dpuClient *dclient,
 static bool
 __handleDpuScanExecArrow(dpuClient *dclient,
 						 dpuTaskExecState *dtes,
-						 kern_data_store *kds_src)
+						 kern_data_store *kds_src,
+						 kern_data_store *kds_fallback)
 {
 	kern_session_info  *session = dclient->session;
 	kern_multirels	   *kmrels = dclient->kmrels;
@@ -2005,10 +2005,8 @@ __handleDpuScanExecArrow(dpuClient *dclient,
 	kern_context	   *kcxt;
 	uint32_t			kds_index;
 
-	assert(kds_src->format == KDS_FORMAT_ARROW &&
-		   kexp_load_vars->opcode == FuncOpCode__LoadVars &&
-		   kexp_scan_quals->exptype == TypeOpCode__bool);
-	INIT_KERNEL_CONTEXT(kcxt, session);
+	assert(kds_src->format == KDS_FORMAT_ARROW);
+	INIT_KERNEL_CONTEXT(kcxt, session, kds_fallback);
 	for (kds_index = 0; kds_index < kds_src->nitems; kds_index++)
 	{
 		kcxt_reset(kcxt);
@@ -2115,7 +2113,7 @@ dpuservHandleDpuTaskExec(dpuClient *dclient, XpuCommand *xcmd)
 									  &base_addr);
 		if (kds_src)
 		{
-			if (__handleDpuScanExecBlock(dclient, dtes, kds_src))
+			if (__handleDpuScanExecBlock(dclient, dtes, kds_src, NULL))
 				dpuClientWriteBack(dclient, dtes);
 			free(base_addr);
 		}
@@ -2131,7 +2129,7 @@ dpuservHandleDpuTaskExec(dpuClient *dclient, XpuCommand *xcmd)
 									  &base_addr);
 		if (kds_src)
 		{
-			if (__handleDpuScanExecArrow(dclient, dtes, kds_src))
+			if (__handleDpuScanExecArrow(dclient, dtes, kds_src, NULL))
 				dpuClientWriteBack(dclient, dtes);
 			free(base_addr);
 		}
@@ -2185,10 +2183,10 @@ dpuservHandleDpuTaskFinal(dpuClient *dclient, XpuCommand *xcmd)
 	{
 		uint32_t	ojmap_length = 0;
 
-		for (int i=0; i < kmrels->num_rels; i++)
+		for (int depth=1; depth <= kmrels->num_rels; depth++)
 		{
-			kern_data_store *kds_in = KERN_MULTIRELS_INNER_KDS(kmrels, i);
-			bool	   *oj_map = KERN_MULTIRELS_OUTER_JOIN_MAP(kmrels, i);
+			kern_data_store *kds_in = KERN_MULTIRELS_INNER_KDS(kmrels, depth);
+			bool	   *oj_map = KERN_MULTIRELS_OUTER_JOIN_MAP(kmrels, depth);
 
 			if (oj_map)
 			{
@@ -2230,19 +2228,31 @@ dpuservHandleDpuTaskFinal(dpuClient *dclient, XpuCommand *xcmd)
 			iov->iov_base = kds_final;
 			iov->iov_len  = sz1;
 
-			sz2 = MAXALIGN(sizeof(uint32_t) * kds_final->nitems);
-			if (sz2 > 0)
+			if (sz1 + sizeof(uint64_t) * (kds_final->hash_nslots +
+										  kds_final->nitems) +
+				kds_final->usage >= kds_final->length)
 			{
+				sz2 = ((char *)kds_final
+					   + kds_final->length
+					   - (char *)iov->iov_base);
 				iov = &iovec_array[iovcnt++];
 				iov->iov_base = KDS_GET_ROWINDEX(kds_final);
 				iov->iov_len  = sz2;
-			}
 
-			sz3 = __kds_unpack(kds_final->usage);
-			if (sz3 > 0)
+				sz3 = 0;
+			}
+			else
 			{
+				sz2 = sizeof(uint64_t) * kds_final->nitems;
 				iov = &iovec_array[iovcnt++];
-				iov->iov_base = (char *)kds_final + kds_final->length - sz3;
+				iov->iov_base = KDS_GET_ROWINDEX(kds_final);
+				iov->iov_len  = sz2;
+
+				sz3 = kds_final->usage;
+				iov = &iovec_array[iovcnt++];
+				iov->iov_base = ((char *)kds_final
+								 + kds_final->length
+								 - kds_final->usage);
 				iov->iov_len  = sz3;
 			}
 			/* fixup kds */
@@ -2255,22 +2265,27 @@ dpuservHandleDpuTaskFinal(dpuClient *dclient, XpuCommand *xcmd)
 			assert(kds_final->format == KDS_FORMAT_ROW &&
 				   kds_final->hash_nslots == 0);
 			sz1 = (KDS_HEAD_LENGTH(kds_final) +
-				   MAXALIGN(sizeof(uint32_t) * kds_final->nitems));
-			if (sz1 > 0)
+				   MAXALIGN(sizeof(uint64_t) * kds_final->nitems));
+			if (sz1 + kds_final->usage >= kds_final->length)
+			{
+				iov = &iovec_array[iovcnt++];
+                iov->iov_base = kds_final;
+				iov->iov_len  = kds_final->length;
+			}
+			else
 			{
 				iov = &iovec_array[iovcnt++];
 				iov->iov_base = kds_final;
 				iov->iov_len  = sz1;
-			}
-			sz2 = __kds_unpack(kds_final->usage);
-			if (sz2 > 0)
-			{
+
 				iov = &iovec_array[iovcnt++];
-				iov->iov_base = (char *)kds_final + kds_final->length - sz2;
-				iov->iov_len  = sz2;
+				iov->iov_base = ((char *)kds_final
+								 + kds_final->length
+								 - kds_final->usage);
+				iov->iov_len  = kds_final->usage;
+				/* fixup kds */
+				kds_final->length = sz1 + kds_final->usage;
 			}
-			/* fixup kds */
-			kds_final->length = sz1 + sz2;
 		}
 		resp.u.results.final_plan_node = true;
 		resp.u.results.chunks_nitems = 1;
@@ -2658,14 +2673,15 @@ int
 main(int argc, char *argv[])
 {
 	static struct option command_options[] = {
-		{"addr",       required_argument, 0, 'a'},
-		{"port",       required_argument, 0, 'p'},
-		{"directory",  required_argument, 0, 'd'},
-		{"nworkers",   required_argument, 0, 'n'},
-		{"identifier", required_argument, 0, 'i'},
-		{"log",        required_argument, 0, 'l'},
-		{"verbose",    no_argument,       0, 'v'},
-		{"help",       no_argument,       0, 'h'},
+		{"addr",       required_argument, 0,  'a'},
+		{"port",       required_argument, 0,  'p'},
+		{"directory",  required_argument, 0,  'd'},
+		{"nworkers",   required_argument, 0,  'n'},
+		{"identifier", required_argument, 0,  'i'},
+		{"log",        required_argument, 0,  'l'},
+		{"direct-io",  no_argument,       0, 1001},
+		{"verbose",    no_argument,       0,  'v'},
+		{"help",       no_argument,       0,  'h'},
 		{NULL, 0, 0, 0},
 	};
 	struct sockaddr *addr;
@@ -2733,7 +2749,13 @@ main(int argc, char *argv[])
 					__Elog("-l|--log option was given twice");
 				dpuserv_logfile = optarg;
 				break;
-				
+
+			case 1001:
+				if (use_direct_io)
+					__Elog("--direct-io was given twice");
+				use_direct_io = true;
+				break;
+
 			case 'v':
 				verbose = true;
 				break;
@@ -2744,6 +2766,8 @@ main(int argc, char *argv[])
 					  "\t-d|--directory=DIR       tablespace base (default: .)\n"
 					  "\t-n|--nworkers=N_WORKERS  number of workers (default: auto)\n"
 					  "\t-i|--identifier=IDENT    security identifier\n"
+					  "\t-l|--log=LOGFILE         log file (default: stderr)\n"
+					  "\t   --direct-io           enables O_DIRECT (default: no)\n"
 					  "\t-v|--verbose             verbose output\n"
 					  "\t-h|--help                shows this message\n",
 					  stderr);

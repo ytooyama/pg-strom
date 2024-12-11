@@ -61,8 +61,6 @@
                   </li>
                   <li class="toctree-l1"><a class="reference internal" href="../postgis/">GPU版PostGIS</a>
                   </li>
-                  <li class="toctree-l1"><a class="reference internal" href="../hll_count/">HyperLogLog</a>
-                  </li>
                   <li class="toctree-l1"><a class="reference internal" href="../troubles/">トラブルシューティング</a>
                   </li>
               </ul>
@@ -85,7 +83,7 @@
                   </li>
                   <li class="toctree-l1"><a class="reference internal" href="../ref_sqlfuncs/">SQLオブジェクト</a>
                   </li>
-                  <li class="toctree-l1 current"><a class="reference internal current" href="./">GUCパラメータ</a>
+                  <li class="toctree-l1 current"><a class="reference internal current" href="#">GUCパラメータ</a>
     <ul class="current">
     <li class="toctree-l2"><a class="reference internal" href="#_1">機能単位の有効化/無効化</a>
     </li>
@@ -106,6 +104,10 @@
               </ul>
               <p class="caption"><span class="caption-text">リリースノート</span></p>
               <ul>
+                  <li class="toctree-l1"><a class="reference internal" href="../release_v5.2/">PG-Strom v5.2</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../release_v5.1/">PG-Strom v5.1</a>
+                  </li>
                   <li class="toctree-l1"><a class="reference internal" href="../release_v5.0/">PG-Strom v5.0</a>
                   </li>
                   <li class="toctree-l1"><a class="reference internal" href="../release_v3.0/">PG-Strom v3.0</a>
@@ -159,7 +161,7 @@
 <dd>GpuPreAggによる集約処理を有効化/無効化する。</dd>
 <dt><code>pg_strom.enable_numeric_aggfuncs</code> [型: <code>bool</code> / 初期値: <code>on]</code></dt>
 <dd><code>numeric</code>データ型を引数に取る集約演算をGPUで処理するかどうかを制御する。</dd>
-<dd>GPUでの集約演算において<code>numeric</code>データ型は倍精度浮動小数点数にマッピングされるため、計算誤差にセンシティブな用途の場合は、この設定値を <code>off</code> にしてCPUで集約演算を実行し、計算誤差の発生を抑えることができます。</dd>
+<dd>GPUでの集約演算において<code>numeric</code>データ型は128bit固定小数点変数にマッピングされるため、極端に大きな数、あるいは高精度な数の集計を行う場合はエラーとなってしまいます。そのようなワークロードに対しては、この設定値を <code>off</code> にしてCPUで集約演算を実行するよう強制する事ができます。</dd>
 <dt><code>pg_strom.enable_brin</code> [型: <code>bool</code> / 初期値: <code>on]</code></dt>
 <dd>BRINインデックスを使ったテーブルスキャンを有効化/無効化する。</dd>
 <dt><code>pg_strom.cpu_fallback</code> [型: <code>enum</code> / 初期値: <code>notice</code>]</dt>
@@ -178,20 +180,14 @@
 <dd>GPUへ送出する／受け取るタプル一個あたりのコストとして使用する値。</dd>
 <dt><code>pg_strom.gpu_operator_cost</code> [型: <code>real</code> / 初期値: <code>DEFAULT_CPU_OPERATOR_COST / 16</code>]</dt>
 <dd>GPUの演算式あたりの処理コストとして使用する値。<code>cpu_operator_cost</code>よりも大きな値を設定してしまうと、いかなるサイズのテーブルに対してもPG-Stromが選択されることはなくなる。</dd>
+<dt><code>pg_strom.enable_partitionwise_gpujoin</code> [型: <code>bool</code> / 初期値: <code>on]</code></dt>
+<dd>GpuJoinを各パーティションの要素へプッシュダウンするかどうかを制御する。</dd>
+<dt><code>pg_strom.enable_partitionwise_gpupreagg</code> [型: <code>bool</code> / 初期値: <code>on]</code></dt>
+<dd>GpuPreAggを各パーティションの要素へプッシュダウンするかどうかを制御する。</dd>
+<dt><code>pg_strom.pinned_inner_buffer_threshold</code> [型: <code>int</code> / 初期値: <code>0</code>]</dt>
+<dd>GpuJoinのINNER表がGpuScanまたはGpuJoinである場合、処理結果の推定サイズがこの設定値よりも大きければ、結果をいったんCPUに戻すことなく、そのままGPU側に保持した上で、続くGpuJoinのINNERバッファとして使用する。</dd>
+<dd>設定値が<code>0</code>の場合、本機能は無効となる。</dd>
 </dl>
-<!--
-
-`pg_strom.enable_partitionwise_gpujoin` [型: `bool` / 初期値: `on]`
-:   GpuJoinを各パーティションの要素へプッシュダウンするかどうかを制御する。
-
-
-
-`pg_strom.enable_partitionwise_gpupreagg` [型: `bool` / 初期値: `on]`
-:   GpuPreAggを各パーティションの要素へプッシュダウンするかどうかを制御する。
-
-
--->
-
 <h2 id="_3">エグゼキュータに関する設定</h2>
 <dl>
 <dt><code>pg_strom.max_async_tasks</code> [型: <code>int</code> / 初期値: <code>12</code>]</dt>
@@ -347,7 +343,7 @@ pg_strom.dpu_endpoint_default_port [型: `int` / 初期値: 6543]
           </div><footer>
     <div class="rst-footer-buttons" role="navigation" aria-label="Footer Navigation">
         <a href="../ref_sqlfuncs/" class="btn btn-neutral float-left" title="SQLオブジェクト"><span class="icon icon-circle-arrow-left"></span> Previous</a>
-        <a href="../release_v5.0/" class="btn btn-neutral float-right" title="PG-Strom v5.0">Next <span class="icon icon-circle-arrow-right"></span></a>
+        <a href="../release_v5.2/" class="btn btn-neutral float-right" title="PG-Strom v5.2">Next <span class="icon icon-circle-arrow-right"></span></a>
     </div>
 
   <hr/>
@@ -373,7 +369,7 @@ pg_strom.dpu_endpoint_default_port [型: `int` / 初期値: 6543]
       <span><a href="../ref_sqlfuncs/" style="color: #fcfcfc">&laquo; Previous</a></span>
     
     
-      <span><a href="../release_v5.0/" style="color: #fcfcfc">Next &raquo;</a></span>
+      <span><a href="../release_v5.2/" style="color: #fcfcfc">Next &raquo;</a></span>
     
   </span>
 </div>

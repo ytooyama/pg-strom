@@ -79,6 +79,33 @@ GpuCacheOptionsEqual(const GpuCacheOptions *a, const GpuCacheOptions *b)
 }
 
 /*
+ * GpuCacheTableSignatureBuffer
+ */
+typedef struct
+{
+	Oid		reltablespace;
+	Oid		relfilenode;	/* if 0, cannot have gpucache */
+	int16	relnatts;
+	GpuCacheOptions gc_options;
+	struct {
+		Oid		atttypid;
+		int32	atttypmod;
+		int16	attlen;
+		bool	attbyval;
+		char	attalign;
+		bool	attnotnull;
+		bool	attisdropped;
+	} attrs[FLEXIBLE_ARRAY_MEMBER];
+} GpuCacheTableSignatureBuffer;
+
+typedef struct
+{
+	Oid			table_oid;
+	uint64_t	signature;
+	GpuCacheOptions gc_options;
+} GpuCacheTableSignatureCache;
+
+/*
  * GpuCacheSharedState (shared structure; dynamic memory mapped)
  */
 typedef struct
@@ -126,6 +153,7 @@ typedef struct
 	kern_data_store	kds_head;
 } GpuCacheSharedState;
 
+#define POSIX_SHMEM_DIRNAME		"/dev/shm"
 #define GpuCacheSharedStateName(nameBuf,nameLen,datOid,relOid,signature) \
 	snprintf((nameBuf), (nameLen),										\
 			 ".gpucache_p%u_d%u_r%u.%09lx.buf",							\
@@ -252,11 +280,38 @@ gpucache_sync_trigger_function_oid(void)
 	return __gpucache_sync_trigger_function_oid;
 }
 
+static inline bool
+is_gpucache_sync_trigger(int16 trig_type,
+						 char trig_enabled,
+						 Oid trig_func_oid,
+						 int16 trig_nargs)
+{
+	if (trig_type == (TRIGGER_TYPE_ROW |
+					  TRIGGER_TYPE_AFTER |
+					  TRIGGER_TYPE_INSERT |
+					  TRIGGER_TYPE_DELETE |
+					  TRIGGER_TYPE_UPDATE) &&
+		(trig_enabled == TRIGGER_FIRES_ON_ORIGIN ||
+		 trig_enabled == TRIGGER_FIRES_ALWAYS) &&
+		trig_func_oid == gpucache_sync_trigger_function_oid() &&
+		(trig_nargs == 0 || trig_nargs == 1))
+	{
+		return true;
+	}
+	return false;
+}
+
 /*
  * parseSyncTriggerOptions
  */
 static bool
-__parseSyncTriggerOptions(const char *__config, GpuCacheOptions *gc_options)
+__parseSyncTriggerOptions(int elevel,
+						  Form_pg_class pg_class,
+						  FormData_pg_attribute *pg_attrs,
+						  Oid trigger_oid,
+						  const char *trigger_name,
+						  const char *trigger_config,
+						  GpuCacheOptions *gc_options)
 {
 	int			cuda_dindex = 0;				/* default: GPU0 */
 	int			gpu_sync_interval = 5000000L;	/* default: 5sec = 5000000us */
@@ -267,11 +322,14 @@ __parseSyncTriggerOptions(const char *__config, GpuCacheOptions *gc_options)
 	char	   *config;
 	char	   *key, *value;
 	char	   *saved;
+	size_t		main_sz = 0;
+	size_t		extra_sz = 0;
+	int			unitsz;
 
-	if (!__config)
+	if (!trigger_config)
 		goto out;
-	config = alloca(strlen(__config) + 1);
-	strcpy(config, __config);
+	config = alloca(strlen(trigger_config) + 1);
+	strcpy(config, trigger_config);
 
 	for (key = strtok_r(config, ",", &saved);
 		 key != NULL;
@@ -280,7 +338,7 @@ __parseSyncTriggerOptions(const char *__config, GpuCacheOptions *gc_options)
 		value = strchr(key, '=');
 		if (!value)
 		{
-			elog(WARNING, "gpucache: options syntax error [%s]", key);
+			elog(elevel, "gpucache: options syntax error [%s]", key);
 			return false;
 		}
 		*value++ = '\0';
@@ -290,19 +348,17 @@ __parseSyncTriggerOptions(const char *__config, GpuCacheOptions *gc_options)
 
 		if (strcmp(key, "gpu_device_id") == 0)
 		{
-			int		i, gpu_device_id;
-			char   *end;
+			int		gpu_device_id;
 
-			gpu_device_id = strtol(value, &end, 10);
-			if (*end != '\0')
+			gpu_device_id = __strtol(value);
+			if (errno != 0)
 			{
-				elog(WARNING, "gpucache: invalid option [%s]=[%s]",
-					 key, value);
+				elog(elevel, "gpucache: invalid option [%s]=[%s] : %m", key, value);
 				return false;
 			}
 
 			cuda_dindex = -1;
-			for (i=0; i < numGpuDevAttrs; i++)
+			for (int i=0; i < numGpuDevAttrs; i++)
 			{
 				if (gpuDevAttrs[i].DEV_ID == gpu_device_id)
 				{
@@ -313,105 +369,138 @@ __parseSyncTriggerOptions(const char *__config, GpuCacheOptions *gc_options)
 
 			if (cuda_dindex < 0)
 			{
-				elog(WARNING, "gpucache: gpu_device_id (%d) not found",
-					 gpu_device_id);
+				elog(elevel, "gpucache: gpu_device_id (%d) not found", gpu_device_id);
 				return false;
 			}
 		}
 		else if (strcmp(key, "max_num_rows") == 0)
 		{
-			char   *end;
-
-			max_num_rows = strtol(value, &end, 10);
-			if (*end != '\0')
+			max_num_rows = __strtol(value);
+			if (errno != 0)
 			{
-				elog(WARNING, "gpucache: invalid option [%s]=[%s]",
-					 key, value);
-				return false;
-			}
-			if (max_num_rows >= UINT_MAX)
-			{
-				elog(WARNING, "gpucache: max_num_rows too large (%lu)",
-					 max_num_rows);
+				elog(elevel, "gpucache: invalid option [%s]=[%s] : %m", key, value);
 				return false;
 			}
 		}
 		else if (strcmp(key, "gpu_sync_interval") == 0)
 		{
-			char   *end;
-
-			gpu_sync_interval = strtol(value, &end, 10);
-			if (*end != '\0')
+			gpu_sync_interval = __strtol(value);
+			if (errno != 0)
 			{
-				elog(WARNING, "gpucache: invalid option [%s]=[%s]",
-					 key, value);
+				elog(elevel, "gpucache: invalid option [%s]=[%s] : %m", key, value);
 				return false;
 			}
 			gpu_sync_interval *= 1000000L;	/* [sec -> us] */
 		}
 		else if (strcmp(key, "gpu_sync_threshold") == 0)
 		{
-			char   *end;
-
-			gpu_sync_threshold = strtol(value, &end, 10);
-			if (strcasecmp(end, "g") == 0 || strcasecmp(end, "gb") == 0)
-				gpu_sync_threshold = (gpu_sync_threshold << 30);
-			else if (strcasecmp(end, "m") == 0 || strcasecmp(end, "mb") == 0)
-				gpu_sync_threshold = (gpu_sync_threshold << 20);
-			else if (strcasecmp(end, "k") == 0 || strcasecmp(end, "kb") == 0)
-				gpu_sync_threshold = (gpu_sync_threshold << 10);
-			else if (*end != '\0')
+			gpu_sync_threshold = __strtosz(value);
+			if (errno != 0)
 			{
-				elog(WARNING, "gpucache: invalid option [%s]=[%s]",
-					 key, value);
+				elog(elevel, "gpucache: invalid option [%s]=[%s]", key, value);
 				return false;
 			}
 		}
 		else if (strcmp(key, "redo_buffer_size") == 0)
 		{
-			char   *end;
-
-			redo_buffer_size = strtol(value, &end, 10);
-			if (strcasecmp(end, "g") == 0 || strcasecmp(end, "gb") == 0)
-				redo_buffer_size = (redo_buffer_size << 30);
-			else if (strcasecmp(end, "m") == 0 || strcasecmp(end, "mb") == 0)
-				redo_buffer_size = (redo_buffer_size << 20);
-			else if (strcasecmp(end, "k") == 0 || strcasecmp(end, "kb") == 0)
-				redo_buffer_size = (redo_buffer_size << 10);
-			else if (*end != '\0')
+			redo_buffer_size = __strtosz(value);
+			if (errno != 0)
 			{
-				elog(WARNING, "gpucache: invalid option [%s]=[%s]",
-					 key, value);
-				return false;
-			}
-			if (redo_buffer_size < (16UL << 20))
-			{
-				elog(WARNING, "gpucache: 'redo_buffer_size' too small (%zu)",
-					 redo_buffer_size);
+				elog(elevel, "gpucache: invalid option [%s]=[%s]", key, value);
 				return false;
 			}
 		}
 		else
 		{
-			elog(WARNING, "gpucache: unknown option [%s]=[%s]", key, value);
+			elog(elevel, "gpucache: unknown option [%s]=[%s]", key, value);
 		}
 	}
 out:
-	if (gc_options)
+	/* default configuration (auto adjustment) */
+	if (gpu_sync_threshold < 0)
+		gpu_sync_threshold = redo_buffer_size / 4;
+	if (rowid_hash_nslots < 0)
+		rowid_hash_nslots = (max_num_rows + max_num_rows / 5);
+
+	/*
+	 * validate configuration parameters
+	 */
+	if (redo_buffer_size < (16UL << 20))
 	{
-		if (gpu_sync_threshold < 0)
-			gpu_sync_threshold = redo_buffer_size / 4;
-		if (gpu_sync_threshold > redo_buffer_size / 2)
+		elog(elevel, "gpucache: 'redo_buffer_size' is too small (%zu)",
+			 redo_buffer_size);
+		return false;
+	}
+	if (redo_buffer_size >= (2UL << 30))
+	{
+		elog(elevel, "gpucache: 'redo_buffer_size' is too large (%zu)",
+			 redo_buffer_size);
+		return false;
+	}
+	if (gpu_sync_threshold < Max(redo_buffer_size / 20, (4UL << 20)))
+	{
+		elog(elevel, "gpucache: 'gpu_sync_threshold' is too small (must be larger than [%zu])", Max(redo_buffer_size/20, (4UL<<20)));
+		return false;
+	}
+	if (gpu_sync_threshold > redo_buffer_size / 2)
+	{
+		elog(elevel, "gpucache: 'gpu_sync_threshold' is too large (must be smaller than [%zu]", redo_buffer_size / 2);
+		return false;
+	}
+	if (max_num_rows >= UINT_MAX)
+	{
+		elog(elevel, "gpucache: max_num_rows too large (%lu)", max_num_rows);
+		return false;
+	}
+
+	/* check initial kds_column/kds_extra size */
+	for (int j=0; j < pg_class->relnatts; j++)
+	{
+		Form_pg_attribute attr = &pg_attrs[j];
+
+		if (!attr->attnotnull)
+			main_sz += MAXALIGN(BITMAPLEN(max_num_rows));
+		if (attr->attlen > 0)
 		{
-			elog(WARNING, "gpucache: gpu_sync_threshold is too small");
+			unitsz = att_align_nominal(attr->attlen,
+									   attr->attalign);
+			main_sz += MAXALIGN(unitsz * max_num_rows);
+		}
+		else if (attr->attlen == -1)
+		{
+			main_sz += MAXALIGN(sizeof(uint32_t) * max_num_rows);
+			unitsz = get_typavgwidth(attr->atttypid,
+									 attr->atttypmod);
+			extra_sz += MAXALIGN(unitsz) * max_num_rows;
+		}
+		else
+		{
+			elog(elevel, "unexpected type length (%d) for type %s",
+				 (int)attr->attlen,
+				 format_type_be(attr->atttypid));
 			return false;
 		}
-		if (rowid_hash_nslots < 0)
-			rowid_hash_nslots = (max_num_rows + max_num_rows / 5);
-		gc_options->cuda_dindex       = cuda_dindex;
+	}
+	main_sz += (MAXALIGN(offsetof(kern_data_store,					/* KDS Header */
+								  colmeta[pg_class->relnatts+1])) +
+				MAXALIGN(sizeof(GpuCacheSysattr) * max_num_rows));	/* System Column */
+	if (extra_sz > 0)
+	{
+		/* 25% margin + header */
+		extra_sz += extra_sz / 4;
+		extra_sz += offsetof(kern_data_extra, data);
+	}
+
+	/*
+	 * write back to the caller
+	 */
+	if (gc_options)
+	{
+		gc_options->tg_sync_row = trigger_oid;
+		gc_options->cuda_dindex = cuda_dindex;
 		gc_options->gpu_sync_interval = gpu_sync_interval;
 		gc_options->gpu_sync_threshold = gpu_sync_threshold;
-		gc_options->max_num_rows      = max_num_rows;
+		gc_options->max_num_rows = max_num_rows;
 		gc_options->rowid_hash_nslots = rowid_hash_nslots;
 		gc_options->redo_buffer_size  = redo_buffer_size;
 	}
@@ -428,105 +517,104 @@ out:
  * The table signature is a simple and lightweight way to detect these cases.
  * ------------------------------------------------------------
  */
-typedef struct
+static uint64_t
+gpuCacheTableSignatureCommon(int elevel,
+							 Form_pg_class pg_class,
+							 FormData_pg_attribute *pg_attrs,
+							 Oid trigger_oid,
+							 const char *trigger_name,
+							 const char *trigger_config,
+							 GpuCacheOptions *gc_options)	/* out */
 {
-	Oid		reltablespace;
-	Oid		relfilenode;	/* if 0, cannot have gpucache */
-	int16	relnatts;
-	GpuCacheOptions gc_options;
-	struct {
-		Oid		atttypid;
-		int32	atttypmod;
-		bool	attnotnull;
-		bool	attisdropped;
-	} attrs[FLEXIBLE_ARRAY_MEMBER];
-} GpuCacheTableSignatureBuffer;
+	GpuCacheTableSignatureBuffer *sig;
+	int			nattrs = pg_class->relnatts;
+	size_t		len;
 
-typedef struct
-{
-	Oid			table_oid;
-	uint64_t	signature;
-	GpuCacheOptions gc_options;
-} GpuCacheTableSignatureCache;
+
+	len = offsetof(GpuCacheTableSignatureBuffer,
+				   attrs[pg_class->relnatts]);
+	sig = alloca(len);
+	memset(sig, 0, len);
+	sig->reltablespace  = pg_class->reltablespace;
+    sig->relfilenode    = pg_class->relfilenode;
+    sig->relnatts       = pg_class->relnatts;
+	for (int j=0; j < nattrs; j++)
+	{
+		Form_pg_attribute attr = &pg_attrs[j];
+
+		sig->attrs[j].atttypid 	 = attr->atttypid;
+		sig->attrs[j].atttypmod  = attr->atttypmod;
+		sig->attrs[j].attlen     = attr->attlen;
+		sig->attrs[j].attbyval   = attr->attbyval;
+		sig->attrs[j].attalign   = attr->attalign;
+		sig->attrs[j].attnotnull = attr->attnotnull;
+		sig->attrs[j].attisdropped = attr->attisdropped;
+	}
+	if (!__parseSyncTriggerOptions(elevel,
+								   pg_class,
+								   pg_attrs,
+								   trigger_oid,
+								   trigger_name,
+								   trigger_config,
+								   &sig->gc_options))
+		return 0UL;
+
+	if (gc_options)
+		memcpy(gc_options, &sig->gc_options, sizeof(GpuCacheOptions));
+	return (uint64_t)hash_any((unsigned char *)sig, len) | 0x100000000UL;
+}
 
 static void
 __gpuCacheTableSignature(Relation rel, GpuCacheTableSignatureCache *entry)
 {
-	GpuCacheTableSignatureBuffer *sig;
-	TupleDesc	tupdesc = RelationGetDescr(rel);
-	int			j, natts = RelationGetNumberOfAttributes(rel);
-	size_t		len;
-	Form_pg_class rd_rel = RelationGetForm(rel);
-	TriggerDesc *trigdesc = rel->trigdesc;
+	TupleDesc		tupdesc = RelationGetDescr(rel);
+	Form_pg_class	rel_form = RelationGetForm(rel);
+	TriggerDesc	   *trigdesc = rel->trigdesc;
+	Oid				trigger_oid = InvalidOid;
+	const char	   *trigger_name = NULL;
+	const char	   *trigger_config = NULL;
 
-	/* pg_class related */
-	if (rd_rel->relkind != RELKIND_RELATION &&
-		rd_rel->relkind != RELKIND_PARTITIONED_TABLE)
+	if (rel_form->relkind != RELKIND_RELATION &&
+		rel_form->relkind != RELKIND_PARTITIONED_TABLE)
 		goto no_gpu_cache;
-	if (rd_rel->relfilenode == 0)
+	if (rel_form->relfilenode == 0)
 		goto no_gpu_cache;
-
-	/* alloc GpuCacheTableSignatureBuffer */
-	len = offsetof(GpuCacheTableSignatureBuffer, attrs[natts]);
-	sig = alloca(len);
-	memset(sig, 0, len);
-	sig->reltablespace	= rd_rel->reltablespace;
-	sig->relfilenode	= rd_rel->relfilenode;
-	sig->relnatts		= rd_rel->relnatts;
-
-	/* sync trigger */
-	if (!trigdesc)
-		goto no_gpu_cache;
-	for (j=0; j < trigdesc->numtriggers; j++)
+	if (trigdesc)
 	{
-		Trigger *trig = &trigdesc->triggers[j];
-
-		if (trig->tgenabled != TRIGGER_FIRES_ON_ORIGIN &&
-			trig->tgenabled != TRIGGER_FIRES_ALWAYS)
-			continue;
-
-		if (trig->tgtype == (TRIGGER_TYPE_ROW |
-							 TRIGGER_TYPE_AFTER |
-							 TRIGGER_TYPE_INSERT |
-							 TRIGGER_TYPE_DELETE |
-							 TRIGGER_TYPE_UPDATE) &&
-			trig->tgfoid == gpucache_sync_trigger_function_oid())
+		for (int i=0; i < trigdesc->numtriggers; i++)
 		{
-			if (OidIsValid(sig->gc_options.tg_sync_row))
-				goto no_gpu_cache;		/* should not call trigger twice per row */
-			if ((trig->tgnargs == 0 &&
-				 __parseSyncTriggerOptions(NULL,
-										   &sig->gc_options)) ||
-				(trig->tgnargs == 1 &&
-				 __parseSyncTriggerOptions(trig->tgargs[0],
-										   &sig->gc_options)))
+			Trigger *trig = &trigdesc->triggers[i];
+
+			if (is_gpucache_sync_trigger(trig->tgtype,
+										 trig->tgenabled,
+										 trig->tgfoid,
+										 trig->tgnargs))
 			{
-				sig->gc_options.tg_sync_row = trig->tgoid;
-			}
-			else
-			{
-				goto no_gpu_cache;
+				if (OidIsValid(trigger_oid))
+					goto no_gpu_cache;
+				if (trig->tgnargs == 1)
+					trigger_config = trig->tgargs[0];
+				else
+					Assert(trig->tgnargs == 0);
+				trigger_oid = trig->tgoid;
+				trigger_name = trig->tgname;
 			}
 		}
+
+		if (OidIsValid(trigger_oid))
+		{
+			entry->signature
+				= gpuCacheTableSignatureCommon(WARNING,
+											   rel_form,
+											   tupdesc->attrs,
+											   trigger_oid,
+											   trigger_name,
+											   trigger_config,
+											   &entry->gc_options);
+			if (entry->signature != 0UL)
+				return;
+		}
 	}
-	if (!OidIsValid(sig->gc_options.tg_sync_row))
-		goto no_gpu_cache;		/* no row sync trigger */
-
-	/* pg_attribute related */
-	for (j=0; j < natts; j++)
-	{
-		Form_pg_attribute attr = TupleDescAttr(tupdesc, j);
-
-		sig->attrs[j].atttypid	= attr->atttypid;
-		sig->attrs[j].atttypmod	= attr->atttypmod;
-		sig->attrs[j].attnotnull = attr->attnotnull;
-		sig->attrs[j].attisdropped = attr->attisdropped;
-	}
-	memcpy(&entry->gc_options, &sig->gc_options,
-		   sizeof(GpuCacheOptions));
-	entry->signature = hash_any((unsigned char *)sig, len) | 0x100000000UL;
-	return;
-
 no_gpu_cache:
 	memset(&entry->gc_options, 0, sizeof(GpuCacheOptions));
 	entry->gc_options.cuda_dindex = -1;
@@ -563,20 +651,21 @@ gpuCacheTableSignature(Relation rel, GpuCacheOptions *gc_options)
 }
 
 static uint64_t
-__gpuCacheTableSignatureSnapshot(HeapTuple pg_class_tuple,
+__gpuCacheTableSignatureSnapshot(Form_pg_class pg_class,
 								 Snapshot snapshot,
 								 GpuCacheOptions *gc_options)
 {
-	GpuCacheTableSignatureBuffer *sig;
-	Form_pg_class pg_class = (Form_pg_class) GETSTRUCT(pg_class_tuple);
+	FormData_pg_attribute *pg_attrs;
 	Oid			table_oid = pg_class->oid;
+	Oid			trigger_oid = InvalidOid;
+	const char *trigger_name = NULL;
+	const char *trigger_config = NULL;
 	Relation	srel;
 	ScanKeyData	skey[2];
 	SysScanDesc	sscan;
 	HeapTuple	tuple;
-	int			j, len;
 
-	/* pg_class validation */
+	/* pg_class */
 	if (pg_class->relkind != RELKIND_RELATION &&
 		pg_class->relkind != RELKIND_PARTITIONED_TABLE)
 		return 0UL;
@@ -584,14 +673,6 @@ __gpuCacheTableSignatureSnapshot(HeapTuple pg_class_tuple,
 		return 0UL;
 	if (!pg_class->relhastriggers)
 		return 0UL;
-
-	len = offsetof(GpuCacheTableSignatureBuffer,
-				   attrs[pg_class->relnatts]);
-	sig = alloca(len);
-	memset(sig, 0, len);
-	sig->reltablespace  = pg_class->reltablespace;
-	sig->relfilenode    = pg_class->relfilenode;
-	sig->relnatts       = pg_class->relnatts;
 
 	/* pg_trigger */
 	srel = table_open(TriggerRelationId, AccessShareLock);
@@ -605,49 +686,37 @@ __gpuCacheTableSignatureSnapshot(HeapTuple pg_class_tuple,
 	{
 		Form_pg_trigger pg_trig = (Form_pg_trigger) GETSTRUCT(tuple);
 
-		if (pg_trig->tgenabled != TRIGGER_FIRES_ON_ORIGIN &&
-			pg_trig->tgenabled != TRIGGER_FIRES_ALWAYS)
-			continue;
-
-		if (pg_trig->tgtype == (TRIGGER_TYPE_ROW |
-								TRIGGER_TYPE_AFTER |
-								TRIGGER_TYPE_INSERT |
-								TRIGGER_TYPE_DELETE |
-								TRIGGER_TYPE_UPDATE) &&
-			pg_trig->tgfoid == gpucache_sync_trigger_function_oid())
+		if (is_gpucache_sync_trigger(pg_trig->tgtype,
+									 pg_trig->tgenabled,
+									 pg_trig->tgfoid,
+									 pg_trig->tgnargs))
 		{
-			if (OidIsValid(sig->gc_options.tg_sync_row))
-				goto no_gpu_cache;
-			if (pg_trig->tgnargs == 0)
+			if (OidIsValid(trigger_oid))	/* duplicate triggers */
 			{
-				if (!__parseSyncTriggerOptions(NULL, &sig->gc_options))
-					goto no_gpu_cache;
+				systable_endscan(sscan);
+				table_close(srel, AccessShareLock);
+				return 0UL;
 			}
-			else if (pg_trig->tgnargs == 1)
+			if (pg_trig->tgnargs == 1)
 			{
 				Datum	datum;
 				bool	isnull;
 
-				datum = fastgetattr(tuple, Anum_pg_trigger_tgargs,
-									RelationGetDescr(srel), &isnull);
-				if (isnull)
-					goto no_gpu_cache;
-				if (!__parseSyncTriggerOptions(VARDATA_ANY(datum),
-											   &sig->gc_options))
-					goto no_gpu_cache;
+				datum = heap_getattr(tuple,
+									 Anum_pg_trigger_tgargs,
+									 RelationGetDescr(srel),
+									 &isnull);
+				if (!isnull)
+					trigger_config = TextDatumGetCString(datum);
 			}
-			else
-			{
-				goto no_gpu_cache;
-			}
-			sig->gc_options.tg_sync_row = pg_trig->oid;
+			trigger_oid = pg_trig->oid;
+			trigger_name = pstrdup(NameStr(pg_trig->tgname));
 		}
 	}
-	if (!OidIsValid(sig->gc_options.tg_sync_row))
-		goto no_gpu_cache;
-
 	systable_endscan(sscan);
 	table_close(srel, AccessShareLock);
+	if (!OidIsValid(trigger_oid))
+		return 0UL;
 
 	/* pg_attribute */
 	srel = table_open(AttributeRelationId, AccessShareLock);
@@ -661,28 +730,27 @@ __gpuCacheTableSignatureSnapshot(HeapTuple pg_class_tuple,
 				Int16GetDatum(0));
 	sscan = systable_beginscan(srel, AttributeRelidNumIndexId,
 							   true, snapshot, 2, skey);
+	pg_attrs = alloca(sizeof(FormData_pg_attribute) * pg_class->relnatts);
+	memset(pg_attrs, 0, sizeof(FormData_pg_attribute) * pg_class->relnatts);
 	while ((tuple = systable_getnext(sscan)) != NULL)
 	{
 		Form_pg_attribute attr = (Form_pg_attribute) GETSTRUCT(tuple);
 
-		Assert(attr->attnum > 0 && attr->attnum <= sig->relnatts);
-		j = attr->attnum - 1;
-		sig->attrs[j].atttypid  = attr->atttypid;
-		sig->attrs[j].atttypmod = attr->atttypmod;
-		sig->attrs[j].attnotnull = attr->attnotnull;
-		sig->attrs[j].attisdropped = attr->attisdropped;
+		Assert(attr->attnum > 0 && attr->attnum <= pg_class->relnatts);
+		memcpy(&pg_attrs[attr->attnum-1], attr,
+			   sizeof(FormData_pg_attribute));
 	}
 	systable_endscan(sscan);
 	table_close(srel, AccessShareLock);
 
-	if (gc_options)
-		memcpy(gc_options, &sig->gc_options, sizeof(GpuCacheOptions));
-	return hash_any((unsigned char *)sig, len) | 0x100000000UL;
-
-no_gpu_cache:
-	systable_endscan(sscan);
-	table_close(srel, AccessShareLock);
-	return 0UL;
+	/* parse & validate options */
+	return gpuCacheTableSignatureCommon(WARNING,
+										pg_class,
+										pg_attrs,
+										trigger_oid,
+										trigger_name,
+										trigger_config,
+										gc_options);
 }
 
 static uint64_t
@@ -707,7 +775,9 @@ gpuCacheTableSignatureSnapshot(Oid table_oid,
 	tuple = systable_getnext(sscan);
 	if (HeapTupleIsValid(tuple))
 	{
-		signature = __gpuCacheTableSignatureSnapshot(tuple,
+		Form_pg_class	pg_class = (Form_pg_class)GETSTRUCT(tuple);
+
+		signature = __gpuCacheTableSignatureSnapshot(pg_class,
 													 snapshot,
 													 gc_options);
 	}
@@ -781,8 +851,8 @@ __setup_kern_data_store_column(kern_data_store *kds_head,
 		if (!attr->attnotnull)
 		{
 			sz = MAXALIGN(BITMAPLEN(nrooms));
-			cmeta->nullmap_offset = __kds_packed(off);
-			cmeta->nullmap_length = __kds_packed(sz);
+			cmeta->nullmap_offset = off;
+			cmeta->nullmap_length = sz;
 			off += sz;
 		}
 
@@ -791,15 +861,15 @@ __setup_kern_data_store_column(kern_data_store *kds_head,
 			unitsz = att_align_nominal(attr->attlen,
 									   attr->attalign);
 			sz = MAXALIGN(unitsz * nrooms);
-			cmeta->values_offset = __kds_packed(off);
-			cmeta->values_length = __kds_packed(sz);
+			cmeta->values_offset = off;
+			cmeta->values_length = sz;
 			off += sz;
 		}
 		else if (attr->attlen == -1)
 		{
-			sz = MAXALIGN(sizeof(uint32) * nrooms);
-			cmeta->values_offset = __kds_packed(off);
-			cmeta->values_length = __kds_packed(sz);
+			sz = MAXALIGN(sizeof(uint64) * nrooms);
+			cmeta->values_offset = off;
+			cmeta->values_length = sz;
 			off += sz;
 			unitsz = get_typavgwidth(attr->atttypid,
 									 attr->atttypmod);
@@ -816,8 +886,8 @@ __setup_kern_data_store_column(kern_data_store *kds_head,
 	/* system column */
 	cmeta = &kds_head->colmeta[kds_head->nr_colmeta - 1];
 	sz = MAXALIGN(cmeta->attlen * nrooms);
-	cmeta->values_offset = __kds_packed(off);
-	cmeta->values_length = __kds_packed(sz);
+	cmeta->values_offset = off;
+	cmeta->values_length = sz;
 	off += sz;
 	kds_head->length = off;
 
@@ -1017,7 +1087,7 @@ __resetGpuCacheSharedState(GpuCacheSharedState *gc_sstate)
 	pthreadMutexUnlock(&gc_sstate->redo_mutex);
 
 	/* make this GpuCache available again */
-	pg_atomic_init_u32(&gc_sstate->phase, GCACHE_PHASE__IS_EMPTY);
+	pg_atomic_write_u32(&gc_sstate->phase, GCACHE_PHASE__IS_EMPTY);
 }
 
 /*
@@ -2633,6 +2703,14 @@ pgstromGpuCacheExecInit(pgstromTaskState *pts)
 			 RelationGetRelationName(rel));
 		return NULL;
 	}
+	/*
+	 * 'pts->optimal_gpus' suggests __gpuClientChooseDevice() to choose
+	 * the right GPU device.
+	 */
+	Assert(gc_options.cuda_dindex >= 0 &&
+		   gc_options.cuda_dindex < numGpuDevAttrs);
+	pts->optimal_gpus = (1UL << gc_options.cuda_dindex);
+
 	return lookupGpuCacheDesc(rel);
 }
 
@@ -2643,13 +2721,15 @@ pgstromScanChunkGpuCache(pgstromTaskState *pts,
 {
 	Relation	rel = pts->css.ss.ss_currentRelation;
 	GpuCacheDesc *gc_desc = pts->gcache_desc;
+	uint32_t	repeat_id;
 	XpuCommand *xcmd = NULL;
 
 	if (!gc_desc)
 		elog(ERROR, "Bug? no GpuCacheDesc is assigned");
 	if (!initialLoadGpuCache(gc_desc, rel))
 		elog(ERROR, "GpuCache is now corrupted, try the query again");
-	if (pg_atomic_fetch_add_u32(pts->gcache_fetch_count, 1) == 0)
+	repeat_id = pg_atomic_fetch_add_u32(pts->gcache_fetch_count, 1);
+	if (repeat_id < pts->num_scan_repeats)
 	{
 		GpuCacheSharedState *gc_sstate = gc_desc->gc_lmap->gc_sstate;
 		uint64_t	write_pos;
@@ -2680,6 +2760,7 @@ pgstromScanChunkGpuCache(pgstromTaskState *pts,
 			gpuCacheInvokeApplyRedo(gc_desc, sync_pos, true);
 		}
 		xcmd = (XpuCommand *)pts->xcmd_buf.data;
+		xcmd->u.task.scan_repeat_id = repeat_id;
 		Assert(xcmd->length == pts->xcmd_buf.len);
 		xcmd_iov->iov_base = pts->xcmd_buf.data;
 		xcmd_iov->iov_len  = pts->xcmd_buf.len;
@@ -2688,7 +2769,14 @@ pgstromScanChunkGpuCache(pgstromTaskState *pts,
 	else
 	{
 		pts->scan_done = true;
+		return NULL;
 	}
+	/* XXX - debug message */
+	if (repeat_id > 0 && repeat_id != pts->last_repeat_id)
+		elog(NOTICE, "gpucache on '%s' moved into %dth loop for inner-buffer partitions (pid: %u)",
+			 RelationGetRelationName(rel), repeat_id+1, MyProcPid);
+	pts->last_repeat_id = repeat_id;
+
 	return xcmd;
 }
 
@@ -2784,8 +2872,8 @@ pgstromGpuCacheExplain(pgstromTaskState *pts,
 					 gpuDevAttrs[gc_options->cuda_dindex].DEV_NAME,
 					 phase,
 					 gc_options->max_num_rows,
-					 format_numeric(gpu_main_size),
-					 format_numeric(gpu_extra_size));
+					 format_bytesz(gpu_main_size),
+					 format_bytesz(gpu_extra_size));
 		}
 		else
 		{
@@ -2882,12 +2970,13 @@ __gpuCacheCallbackOnAlterTable(Oid table_oid)
  * gpuCacheObjectAccess, and related...
  */
 static void
-__gpuCacheCallbackOnAlterTrigger(Oid trigger_oid)
+__gpuCacheCallbackOnAlterTrigger(Oid trigger_oid, bool validate_options)
 {
 	Relation	srel;
 	ScanKeyData	skey;
 	SysScanDesc	sscan;
 	HeapTuple	tuple;
+	int			elevel = (validate_options ? ERROR : WARNING);
 
 	srel = table_open(TriggerRelationId, AccessShareLock);
 	ScanKeyInit(&skey,
@@ -2898,9 +2987,50 @@ __gpuCacheCallbackOnAlterTrigger(Oid trigger_oid)
 							   SnapshotSelf, 1, &skey);
 	while ((tuple = systable_getnext(sscan)) != NULL)
 	{
-		Oid		table_oid = ((Form_pg_trigger)GETSTRUCT(tuple))->tgrelid;
+		Form_pg_trigger	pg_trig = (Form_pg_trigger)GETSTRUCT(tuple);
+		Relation	__rel = table_open(pg_trig->tgrelid, NoLock);
+		const char *trigger_name = NameStr(pg_trig->tgname);
+		const char *trigger_config = NULL;
+		Datum		datum;
+		bool		isnull;
 
-		__gpuCacheCallbackOnAlterTable(table_oid);
+		datum = heap_getattr(tuple,
+							 Anum_pg_trigger_tgargs,
+							 RelationGetDescr(srel),
+							 &isnull);
+		if (!isnull)
+			trigger_config = TextDatumGetCString(datum);
+
+		gpuCacheTableSignatureCommon(ERROR,
+									 RelationGetForm(__rel),
+									 RelationGetDescr(__rel)->attrs,
+									 trigger_oid,
+									 trigger_name,
+									 trigger_config,
+									 NULL);
+		/* duplication checks */
+		if (__rel->trigdesc)
+		{
+			TriggerDesc *trigdesc = __rel->trigdesc;
+
+			for (int i=0; i < trigdesc->numtriggers; i++)
+			{
+				Trigger	*trigger = &trigdesc->triggers[i];
+
+				if (trigger->tgoid != trigger_oid &&
+					is_gpucache_sync_trigger(trigger->tgtype,
+											 trigger->tgenabled,
+											 trigger->tgfoid,
+											 trigger->tgnargs))
+				{
+					elog(elevel, "gpucache: relation %s has multiple row-sync triggers",
+						 RelationGetRelationName(__rel));
+				}
+			}
+		}
+		table_close(__rel, NoLock);
+
+		__gpuCacheCallbackOnAlterTable(pg_trig->tgrelid);
 	}
 	systable_endscan(sscan);
 	table_close(srel, AccessShareLock);
@@ -2970,6 +3100,63 @@ __gpuCacheOnDropTrigger(Oid trigger_oid)
 }
 
 static void
+__gpuCacheOnDropDatabase(Oid database_oid)
+{
+	const char *dirname = POSIX_SHMEM_DIRNAME;
+	DIR		   *dir;
+	struct dirent *dentry;
+
+	/*
+	 * DROP DATABASE should already take AccessExclusiveLock on the target
+	 * database, thus, there are no active sessions here, and no more
+	 * sessions will be made.
+	 */
+	Assert(database_oid != MyDatabaseId);
+	dir = AllocateDir(dirname);
+	while ((dentry = ReadDir(dir, dirname)) != NULL)
+	{
+		uint32_t		__port;
+		uint32_t		__database_oid;
+		uint32_t		__table_oid;
+		uint64_t		__signature;
+		GpuCacheDesc	hkey;
+		GpuCacheDesc   *gc_desc;
+
+		if (strncmp(dentry->d_name, ".gpucache_", 10) == 0 &&
+			sscanf(dentry->d_name,
+				   ".gpucache_p%u_d%u_r%u.%09lx.buf",
+				   &__port,
+				   &__database_oid,
+				   &__table_oid,
+				   &__signature) == 4 &&
+			__port == PostPortNumber &&
+			__database_oid == database_oid)
+		{
+			/* inject a dummy entry to drop shared memory segment */
+			memset(&hkey, 0, sizeof(GpuCacheDesc));
+			hkey.ident.database_oid = __database_oid;
+			hkey.ident.table_oid = __table_oid;
+			hkey.ident.signature = __signature;
+			hkey.xid = GetCurrentTransactionId();
+			Assert(TransactionIdIsValid(hkey.xid));
+
+			gc_desc = hash_search(gcache_descriptors_htab,
+								  &hkey, HASH_ENTER, NULL);
+			if (gc_desc)
+			{
+				memset(&gc_desc->gc_options, 0, sizeof(GpuCacheOptions));
+				gc_desc->gc_lmap = NULL;
+				gc_desc->drop_on_rollback = false;
+				gc_desc->drop_on_commit = true;
+				gc_desc->nitems = 0;
+				memset(&gc_desc->buf, 0, sizeof(StringInfoData));
+			}
+		}
+	}
+	FreeDir(dir);
+}
+
+static void
 gpuCacheObjectAccess(ObjectAccessType access,
 					 Oid classId,
 					 Oid objectId,
@@ -2995,7 +3182,7 @@ gpuCacheObjectAccess(ObjectAccessType access,
 #ifdef GPUCACHE_DEBUG_MESSAGE
 			elog(LOG, "pid=%u OAT_POST_CREATE (pg_trigger, objectId=%u)", getpid(), objectId);
 #endif
-			__gpuCacheCallbackOnAlterTrigger(objectId);
+			__gpuCacheCallbackOnAlterTrigger(objectId, true);
 		}
 	}
 	else if (access == OAT_POST_ALTER)
@@ -3012,7 +3199,7 @@ gpuCacheObjectAccess(ObjectAccessType access,
 #ifdef GPUCACHE_DEBUG_MESSAGE
 			elog(LOG, "pid=%u OAT_POST_ALTER (pg_trigger, objectId=%u)", getpid(), objectId);
 #endif
-			__gpuCacheCallbackOnAlterTrigger(objectId);
+			__gpuCacheCallbackOnAlterTrigger(objectId, false);
 		}
 	}
 	else if (access == OAT_DROP)
@@ -3030,6 +3217,13 @@ gpuCacheObjectAccess(ObjectAccessType access,
 			elog(LOG, "pid=%u OAT_DROP (pg_trigger, objectId=%u)", getpid(), objectId);
 #endif
 			__gpuCacheOnDropTrigger(objectId);
+		}
+		else if (classId == DatabaseRelationId)
+		{
+#ifdef GPUCACHE_DEBUG_MESSAGE
+			elog(LOG, "pid=%u OAT_DROP (pg_database, objectId=%u)", getpid(), objectId);
+#endif
+			__gpuCacheOnDropDatabase(objectId);
 		}
 	}
 	else if (access == OAT_TRUNCATE)
@@ -3455,7 +3649,7 @@ __gpucacheExecApplyRedoKernel(GpuCacheControlCommand *cmd,
 
 		Assert((uintptr_t)pos == MAXALIGN((uintptr_t)pos));
 		gcache_redo->redo_items[gcache_redo->nitems++]
-			= __kds_packed((char *)pos - (char *)gcache_redo);
+			= (uint32_t)((char *)pos - (char *)gcache_redo);
 		pos += tx_log->length;
 	}
 
@@ -3499,34 +3693,7 @@ retry:
 		goto bailout;
 	}
 
-	if (gcache_redo->kerror.errcode == ERRCODE_BUFFER_NO_SPACE)
-	{
-		kern_data_extra *extra = (kern_data_extra *)gc_lmap->gcache_extra_devptr;
-		size_t		gcache_extra_size;
-		int			__status;
-
-		/* expand the extra buffer with 25% larger virtual space */
-		gcache_extra_size = PAGE_ALIGN((extra->length * 5) / 4);
-		__status = __gpucacheExecCompactionKernel(cmd,
-												  gc_lmap,
-												  f_gcache_compaction,
-												  gcache_extra_size);
-		if (__status == 0)
-			goto retry;
-		/* abort */
-		status = __status;
-	}
-	else if (gcache_redo->kerror.errcode != ERRCODE_STROM_SUCCESS)
-	{
-		snprintf(cmd->errbuf, sizeof(cmd->errbuf),
-				 "gpucache: %s (%s:%d) %s (errcode=%d)\n",
-				 gcache_redo->kerror.funcname,
-				 gcache_redo->kerror.filename,
-				 gcache_redo->kerror.lineno,
-				 gcache_redo->kerror.message,
-				 gcache_redo->kerror.errcode);
-	}
-	else
+	if (gcache_redo->kerror.errcode == 0)
 	{
 		kern_data_store	   *kds = (kern_data_store *)gc_lmap->gcache_main_devptr;
 		kern_data_extra	   *extra = (kern_data_extra *)gc_lmap->gcache_extra_devptr;
@@ -3547,6 +3714,34 @@ retry:
 				pg_atomic_read_u64(&gc_sstate->gcache_extra_dead));
 #endif
 		status = 0;		/* success */
+	}
+	else if (gcache_redo->kerror.errcode == ERRCODE_SUSPEND_NO_SPACE)
+	{
+		kern_data_extra *extra = (kern_data_extra *)gc_lmap->gcache_extra_devptr;
+		size_t		gcache_extra_size;
+		int			__status;
+
+		/* expand the extra buffer with 25% larger virtual space */
+		gcache_extra_size = PAGE_ALIGN((extra->length * 5) / 4);
+		__status = __gpucacheExecCompactionKernel(cmd,
+												  gc_lmap,
+												  f_gcache_compaction,
+												  gcache_extra_size);
+		if (__status == 0)
+			goto retry;
+		/* abort */
+		status = __status;
+	}
+	else
+	{
+		/* significant error */
+		snprintf(cmd->errbuf, sizeof(cmd->errbuf),
+				 "gpucache: %s (%s:%d) %s (errcode=%d)\n",
+				 gcache_redo->kerror.funcname,
+				 gcache_redo->kerror.filename,
+				 gcache_redo->kerror.lineno,
+				 gcache_redo->kerror.message,
+				 gcache_redo->kerror.errcode);
 	}
 bailout:
 	if (m_gcache_redo != 0UL)
@@ -3632,33 +3827,14 @@ __gpucacheExecDropUnload(GpuCacheControlCommand *cmd)
 void
 gpucacheManagerEventLoop(int cuda_dindex,
 						 CUcontext cuda_context,
-						 CUmodule cuda_module)
+						 CUfunction cufn_gpucache_apply_redo,
+						 CUfunction cufn_gpucache_compaction)
 {
 	pthread_mutex_t *cmd_mutex = &gcache_shared_head->gcache_cmd_mutex;
 	pthread_cond_t *cmd_cond = &gcache_shared_head->gpus[cuda_dindex].cond;
 	dlist_head	   *cmd_queue = &gcache_shared_head->gpus[cuda_dindex].queue;
-	CUfunction		f_gcache_apply_redo;
-	CUfunction		f_gcache_compaction;
-	CUresult		rc;
 	GpuCacheControlCommand *cmd;
 
-	rc = cuModuleGetFunction(&f_gcache_apply_redo,
-							 cuda_module,
-							 "kern_gpucache_apply_redo");
-	if (rc != CUDA_SUCCESS)
-	{
-		fprintf(stderr, "gpucache: unable to lookup gpucache_apply_redo\n");
-		return;
-	}
-	rc = cuModuleGetFunction(&f_gcache_compaction,
-							 cuda_module,
-							 "kern_gpucache_compaction");
-	if (rc != CUDA_SUCCESS)
-	{
-		fprintf(stderr, "gpucache: unable to lookup gpucache_compaction\n");
-		return;
-	}
-	
 	pthreadMutexLock(cmd_mutex);
 	while (!gpuServiceGoingTerminate())
 	{
@@ -3683,11 +3859,12 @@ gpucacheManagerEventLoop(int cuda_dindex,
 		{
 			case GCACHE_CONTROL_CMD__APPLY_REDO:
 				status = __gpucacheExecApplyRedo(cmd,
-												 f_gcache_apply_redo,
-												 f_gcache_compaction);
+												 cufn_gpucache_apply_redo,
+												 cufn_gpucache_compaction);
 				break;
 			case GCACHE_CONTROL_CMD__COMPACTION:
-				status = __gpucacheExecCompaction(cmd, f_gcache_compaction);
+				status = __gpucacheExecCompaction(cmd,
+												  cufn_gpucache_compaction);
 				break;
 			case GCACHE_CONTROL_CMD__DROP_UNLOAD:
 				status = __gpucacheExecDropUnload(cmd);
@@ -3995,7 +4172,7 @@ __gpuCacheAutoPreloadConnectDatabaseAny(int32 *p_start, int32 *p_end)
 
 		if (namespace_oid == PG_CATALOG_NAMESPACE)
 			continue;
-		if (__gpuCacheTableSignatureSnapshot(tuple, NULL, NULL) == 0)
+		if (__gpuCacheTableSignatureSnapshot(pg_class, NULL, NULL) == 0)
 			continue;
 
 		while (nitems >= nrooms)
@@ -4051,6 +4228,7 @@ gpuCacheAutoPreloadConnectDatabase(int32 *p_start, int32 *p_end)
 
 		if (strcmp(database_name, entry->database_name) != 0)
 			break;
+		curr++;
 	}
 	gcache_shared_head->gcache_auto_preload_count = curr;
 
@@ -4092,7 +4270,8 @@ gpuCacheStartupPreloader(Datum arg)
 
 		rel = table_openrv(&rvar, AccessShareLock);
 		gc_desc = lookupGpuCacheDesc(rel);
-		initialLoadGpuCache(gc_desc, rel);
+		if (gc_desc)
+			initialLoadGpuCache(gc_desc, rel);
 		table_close(rel, NoLock);
 
 		elog(LOG, "gpucache: auto preload '%s.%s' (DB: %s)",
@@ -4115,7 +4294,7 @@ PG_FUNCTION_INFO_V1(pgstrom_gpucache_info);
 static List *
 __pgstrom_gpucache_info(void)
 {
-	const char *dirname = "/dev/shm";
+	const char *dirname = POSIX_SHMEM_DIRNAME;
 	DIR		   *dir;
 	struct dirent *dentry;
 	char		buffer[sizeof(GpuCacheSharedState)];
